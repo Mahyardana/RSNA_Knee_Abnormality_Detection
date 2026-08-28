@@ -17,3 +17,5 @@
 /yolo_sagittal.pt
 /yolo_sagittal.torchscript
 /venv-cu12/lib64/
+/*.pt
+/*.pth
