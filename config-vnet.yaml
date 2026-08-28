@@ -1,0 +1,252 @@
+# DEPENDENCY: monai>=0.5.3,<=0.6.0
+AUG_TEST:
+  UNDERSAMPLE:
+    ACCELERATIONS:
+    - 6
+AUG_TRAIN:
+  NOISE_P: 0.2
+  UNDERSAMPLE:
+    ACCELERATIONS:
+    - 6
+    CALIBRATION_SIZE: 24
+    CENTER_FRACTIONS: []
+    NAME: PoissonDiskMaskFunc
+    PRECOMPUTE:
+      NUM: -1
+      SEED: -1
+  USE_NOISE: false
+CUDNN_BENCHMARK: false
+DATALOADER:
+  ALT_SAMPLER:
+    PERIOD_SUPERVISED: 1
+    PERIOD_UNSUPERVISED: 1
+  DATA_KEYS: []
+  DROP_LAST: true
+  FILTER:
+    BY: []
+  GROUP_SAMPLER:
+    AS_BATCH_SAMPLER: true
+    BATCH_BY:
+    - inplane_shape
+  NUM_WORKERS: 8
+  PREFETCH_FACTOR: 2
+  SAMPLER_TRAIN: ''
+  SUBSAMPLE_TRAIN:
+    NUM_TOTAL: -1
+    NUM_TOTAL_BY_GROUP: []
+    NUM_UNDERSAMPLED: 0
+    NUM_VAL: -1
+    NUM_VAL_BY_GROUP: []
+    SEED: 1000
+DATASETS:
+  QDESS:
+    DATASET_TYPE: qDESSImageDataset
+    ECHO_KIND: rms
+    KWARGS:
+    - orientation
+    - sagittal
+  TEST:
+  - stanford_qdess_v0.1.0_test
+  TRAIN:
+  - stanford_qdess_v0.1.0_train
+  VAL:
+  - stanford_qdess_v0.1.0_val
+DESCRIPTION:
+  BRIEF: VNet segmentation following parameters used in MONAI - input=rms, 100 epochs,
+    0.001 lr w/ 0.9x decay every (2,) epochs, early stopping- T=0, delta=0.0, bsz=16,
+    qdess args=('orientation', 'sagittal')
+  ENTITY_NAME: ss_recon
+  EXP_NAME: seg-baseline/vnet-medsegpy-rms-bsz=16
+  PROJECT_NAME: ss_recon
+  TAGS:
+  - seg-baseline
+  - baseline
+  - vnet-monai
+  - neurips
+MODEL:
+  CASCADE:
+    ITFS:
+      PERIOD: 0
+    RECON_MODEL_NAME: ''
+    SEG_MODEL_NAME: ''
+    SEG_NORMALIZE: ''
+    USE_MAGNITUDE: false
+    ZERO_FILL: false
+  CS:
+    MAX_ITER: 200
+    REGULARIZATION: 0.005
+  DENOISING:
+    META_ARCHITECTURE: GeneralizedUnrolledCNN
+    NOISE:
+      STD_DEV:
+      - 1
+      USE_FULLY_SAMPLED_TARGET: true
+      USE_FULLY_SAMPLED_TARGET_EVAL: null
+  DEVICE: cpu
+  META_ARCHITECTURE: VNetMONAI
+  N2R:
+    META_ARCHITECTURE: GeneralizedUnrolledCNN
+    USE_SUPERVISED_CONSISTENCY: false
+  NORMALIZER:
+    KEYWORDS: []
+    NAME: TopMagnitudeNormalizer
+  PARAMETERS:
+    INIT:
+    - initializers: (("kaiming_normal_", {"nonlinearity":"relu"}), "zeros_")
+      kind: conv
+      patterns: (".*weight", ".*bias")
+    - initializers: ("ones_", "zeros_")
+      kind: norm
+      patterns: (".*weight", ".*bias")
+    - initializers: ("xavier_uniform_",)
+      patterns: ("output_block\.weight",)
+    USE_COMPLEX_WEIGHTS: false
+  RECON_LOSS:
+    NAME: l1
+    RENORMALIZE_DATA: true
+    WEIGHT: 1.0
+  SEG:
+    ACTIVATION: sigmoid
+    CLASSES:
+    - pc
+    - fc
+    - tc
+    - men
+    INCLUDE_BACKGROUND: false
+    IN_CHANNELS: null
+    LOSS_NAME: FlattenedDiceLoss
+    LOSS_WEIGHT: 1.0
+    MODEL:
+      DYNUNET_MONAI:
+        DEEP_SUPERVISION: false
+        DEEP_SUPR_NUM: 1
+        KERNEL_SIZE:
+        - 3
+        NORM_NAME: instance
+        RES_BLOCK: false
+        STRIDES:
+        - 1
+        UPSAMPLE_KERNEL_SIZE:
+        - 2
+      UNET_MONAI:
+        ACTIVATION:
+        - prelu
+        - {}
+        CHANNELS: []
+        DROPOUT: 0.0
+        KERNEL_SIZE:
+        - 3
+        NORM:
+        - instance
+        - {}
+        NUM_RES_UNITS: 0
+        STRIDES: []
+        UP_KERNEL_SIZE:
+        - 3
+      VNET_MONAI:
+        ACTIVATION:
+        - elu
+        - inplace: true
+        DROPOUT_DIM: 2
+        DROPOUT_PROB: 0.0
+    USE_MAGNITUDE: true
+  TASKS:
+  - sem_seg
+  TB_RECON:
+    CHANNELS:
+    - 16
+    - 32
+    - 64
+    DEC_NUM_CONV_BLOCKS:
+    - 2
+    - 3
+    ENC_NUM_CONV_BLOCKS:
+    - 1
+    - 2
+    - 3
+    KERNEL_SIZE:
+    - 5
+    MULTI_CONCAT: []
+    ORDER:
+    - conv
+    - relu
+    STRIDES:
+    - 2
+    USE_MAGNITUDE: false
+  UNET:
+    BLOCK_ORDER:
+    - conv
+    - instancenorm
+    - - leakyrelu
+      - negative_slope: 0.2
+    - dropout
+    CHANNELS: 32
+    DROPOUT: 0.0
+    IN_CHANNELS: 2
+    NUM_POOL_LAYERS: 4
+    OUT_CHANNELS: 2
+  UNROLLED:
+    CONV_BLOCK:
+      ACTIVATION: relu
+      NORM: none
+      NORM_AFFINE: false
+      ORDER:
+      - norm
+      - act
+      - drop
+      - conv
+    DROPOUT: 0.0
+    FIX_STEP_SIZE: false
+    KERNEL_SIZE:
+    - 3
+    NUM_EMAPS: 1
+    NUM_FEATURES: 256
+    NUM_RESBLOCKS: 2
+    NUM_UNROLLED_STEPS: 5
+    PADDING: ''
+    SHARE_WEIGHTS: false
+  WEIGHTS: ''
+OUTPUT_DIR: results://skm-tea/neurips2021/V-Net_RSS
+SEED: 9001
+SOLVER:
+  BASE_LR: 0.001
+  CHECKPOINT_MONITOR: val_loss
+  CHECKPOINT_PERIOD: 1
+  EARLY_STOPPING:
+    MIN_DELTA: 0.0
+    MONITOR: val_loss
+    PATIENCE: 0
+  GAMMA: 0.9
+  GRAD_ACCUM_ITERS: 1
+  LR_SCHEDULER_NAME: StepLR
+  MAX_ITER: 100
+  MIN_LR: 1.0e-08
+  MOMENTUM: 0.9
+  OPTIMIZER: Adam
+  STEPS:
+  - 2
+  TEST_BATCH_SIZE: 40
+  TRAIN_BATCH_SIZE: 16
+  WARMUP_FACTOR: 0.001
+  WARMUP_ITERS: 1000
+  WARMUP_METHOD: linear
+  WEIGHT_DECAY: 0.0
+  WEIGHT_DECAY_NORM: 0.0
+TEST:
+  EVAL_PERIOD: 1
+  EXPECTED_RESULTS: []
+  FLUSH_PERIOD: -5
+  QDESS_EVALUATOR:
+    ADDITIONAL_PATHS: []
+  VAL_METRICS:
+    RECON: []
+    SEM_SEG:
+    - DSC
+    - VOE
+    - CV
+    - DSC_scan
+    - VOE_scan
+    - CV_scan
+TIME_SCALE: epoch
+VERSION: 1
+VIS_PERIOD: -100
