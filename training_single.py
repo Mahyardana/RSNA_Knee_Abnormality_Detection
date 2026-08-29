@@ -78,7 +78,7 @@ class Config:
     VAL_FRACTION = 0.10  # 20% val, 80% train
 
     # ── Training hyperparameters ──────────────────────────────────────
-    BATCH_SIZE = 1
+    BATCH_SIZE = 4
     NUM_WORKERS = 0
     GRAD_ACCUM_STEPS = 1
     WARMUP_EPOCHS = 5
@@ -1131,78 +1131,66 @@ class KneeStudyTrainDataset(Dataset):
 
 # ── Collate function ──────────────────────────────────────────────────────────
 def collate_fn(batch: List[Dict]) -> Dict:
-    max_s = cfg.MAX_SERIES_PER_STUDY
-    max_slice = cfg.MAX_SLICES_PER_SERIES  # max(b['slices'].shape[1] for b in batch)#cfg.MAX_SLICES_PER_SERIES
-    max_height = max(b['slices'].shape[-2] for b in batch)
-    max_width = max(b['slices'].shape[-1] for b in batch)
-    padded_slices = []
-    padded_planes = []
-    padded_fluids = []
-    padded_fats = []
-    slice_masks = []
-    study_ids = []
-    labels = []
-    placeholder_planes = 10.0
-    placeholder_fluids = 10.0
-    placeholder_fats = 10.0
-    for b in batch:
-        s = b['slices'].shape[0]
-        slice_len = b['slices'].shape[1]
-        study_ids.append(b['study_id'])
-        labels.append(b['labels'])
-        # padded_slice = b['slices']
-        # if padded_slice.shape[-2] < max_height or padded_slice.shape[-1] < max_width:
-        #     pad_height = max_height - padded_slice.shape[-2]
-        #     pad_width = max_width - padded_slice.shape[-1]
-        #     padded_slice = F.pad(padded_slice, (0, pad_width, 0, pad_height), value=0, mode="constant")
-        # if slice_len<max_slice:
-        #     sizediff = max_slice - slice_len
-        #     padded_slice = torch.cat([padded_slice, torch.zeros((s,sizediff, 3, max_height, max_width))],dim=1)
-        # if s < max_s:
-        #     pad_img = torch.zeros(max_s - s, *padded_slice.shape[1:])
-        #     padded_slices.append(torch.cat([padded_slice, pad_img], dim=0))
-        #     pad_idx = torch.ones(max_s - s)
-        #     padded_planes.append(torch.cat([b['plane_ids'], pad_idx*placeholder_planes], dim=0))
-        #     padded_fluids.append(torch.cat([b['fluid_sensitive'], pad_idx*placeholder_fluids], dim=0))
-        #     padded_fats.append(torch.cat([b['fat_suppression'], pad_idx*placeholder_fats], dim=0))
-        #
-        #     mask = torch.cat([torch.zeros(s, dtype=torch.bool), torch.ones(max_s - s, dtype=torch.bool)])
-        #     slice_masks.append(mask)
-        # else:
-        #     padded_slices.append(padded_slice)
-        #     padded_planes.append(b['plane_ids'])
-        #     padded_fluids.append(b['fluid_sensitive'])
-        #     padded_fats.append(b['fat_suppression'])
-        #     slice_masks.append(torch.zeros(s, dtype=torch.bool))
-        # max_slice = max(slices.shape[0] for slices in all_slices)
-        # max_height = max(slices.shape[2] for slices in all_slices)
-        # max_width = max(slices.shape[3] for slices in all_slices)
-        # if max_height % 14 != 0:
-        #     max_height += 14 - (max_height % 14)
-        # if max_width % 14 != 0:
-        #     max_width += 14 - (max_width % 14)
-        #
-        # for idx in range(len(all_slices)):
-        #     if all_slices[idx].shape[2] < max_height or all_slices[idx].shape[3] < max_width:
-        #         pad_height = max_height - all_slices[idx].shape[2]
-        #         pad_width = max_width - all_slices[idx].shape[3]
-        #         all_slices[idx] = F.pad(all_slices[idx], (0, pad_width, 0, pad_height), value=0, mode="constant")
-        #     if all_slices[idx].shape[0] < max_slice:
-        #         sizediff = max_slice - all_slices[idx].shape[0]
-        #         all_slices[idx] = torch.cat([all_slices[idx], torch.zeros((sizediff, 3, max_height, max_width))],
-        #                                     dim=0)
-    # images = [[torch.stack(padded_slice) for padded_slice in padded_slice_outer] for padded_slice_outer in padded_slices] # (B, max_s, 3, 224, 224)
-    # Pad natively for RadDino to 14x multiples
-    images = padded_slices  # (B, max_s, 3, H, W)
+    studies = [x["study_id"] for x in batch]
+    slices = [x["slices"] for x in batch]
+    slicemasks = [x["slicemasks"] for x in batch]
+    plane_ids = [x["plane_ids"] for x in batch]
+    fluids = [x["fluid_sensitive"] for x in batch]
+    fats = [x["fat_suppression"] for x in batch]
+    labels = [x["labels"] for x in batch]
+    plane_crop_mixed = [x["plane_crop_mixed"] for x in batch]
+    maxslicesize = max([slice.shape[1] for slice in slices])
+    maxseriesize = max([slice.shape[0] for slice in slices])
+    paddedslices = []
+    paddedslicemasks = []
+    paddedplane_ids = []
+    paddedfluids = []
+    paddedfats = []
+    paddedplane_crop_mixed = []
+    seriemasks = []
 
+    for i in range(len(slices)):
+        newslice = slices[i]
+        newslicemask = slicemasks[i]
+        newplane_id = plane_ids[i]
+        newfluid = fluids[i]
+        newfat = fats[i]
+        newplane_crop_mixed = plane_crop_mixed[i]
+        newseriemask = torch.ones_like(newplane_id, dtype=torch.bool)
+        if newslice.shape[1] < maxslicesize:
+            slicediffer = maxslicesize - newslice.shape[1]
+            newslice = torch.cat([newslice, torch.zeros((newslice.shape[0], slicediffer, newslice.shape[-1]))], dim=1)
+            newslicemask = torch.cat(
+                (newslicemask, torch.zeros((newslicemask.shape[0], slicediffer), dtype=torch.bool)), dim=1)
+        if newslice.shape[0] < maxseriesize:
+            s = newslice.shape[0]
+            seriediffer = maxseriesize - s
+            newslice = torch.cat([newslice, torch.zeros((seriediffer, newslice.shape[1], newslice.shape[-1]))], dim=0)
+            newslicemask = torch.cat(
+                (newslicemask, torch.zeros((seriediffer, newslicemask.shape[1]), dtype=torch.bool)), dim=0)
+            paddingones = torch.ones([seriediffer])
+            newplane_id = torch.cat((newplane_id, paddingones * 10.0), dim=0)
+            newfluid = torch.cat((newfluid, paddingones * 10.0), dim=0)
+            newfat = torch.cat((newfat, paddingones * 10.0), dim=0)
+            newseriemask = torch.cat((newseriemask, torch.zeros(seriediffer, dtype=torch.bool)), dim=0)
+            newplane_crop_mixed = torch.cat((newplane_crop_mixed, torch.ones((seriediffer, 2)) * 10.0), dim=0)
+        paddedslices.append(newslice)
+        paddedslicemasks.append(newslicemask)
+        paddedplane_ids.append(newplane_id)
+        paddedfluids.append(newfluid)
+        paddedfats.append(newfat)
+        seriemasks.append(newseriemask)
+        paddedplane_crop_mixed.append(newplane_crop_mixed)
     return {
-        'study_ids': study_ids,
-        'slice_features': torch.stack(images),
-        'slice_mask': torch.stack(slice_masks),
-        'plane_ids': torch.stack(padded_planes),
-        'fluid_sensitive': torch.stack(padded_fluids),
-        'fat_suppression': torch.stack(padded_fats),
-        'labels': torch.stack(labels),
+        "study_id": studies,
+        "labels": torch.stack(labels, dim=0),
+        "slicemasks": torch.stack(paddedslicemasks, dim=0),
+        "plane_ids": torch.stack(paddedplane_ids, dim=0).long(),
+        "fluid_sensitive": torch.stack(paddedfluids, dim=0).long(),
+        "fat_suppression": torch.stack(paddedfats, dim=0).long(),
+        "seriemasks": torch.stack(seriemasks, dim=0),
+        "slices": torch.stack(paddedslices, dim=0),
+        "plane_crop_mixed": torch.stack(paddedplane_crop_mixed, dim=0).long(),
     }
 
 
@@ -1439,7 +1427,7 @@ class CachedEmbeddingDataset(torch.utils.data.Dataset):
 
         plane_crop_mixed = data["plane_crop_mixed"]
         if label_filter:
-            mask = (labels[:, cfg.TRAINING_LABEL] >= 0.99) | (labels[:, cfg.TRAINING_LABEL] <= 0.15)
+            mask = (labels[:, cfg.TRAINING_LABEL] >= 0.90) | (labels[:, cfg.TRAINING_LABEL] <= 0.15)
         else:
             mask=torch.ones(labels.shape[0], dtype=torch.bool)
         masknp=mask.numpy()
@@ -1649,7 +1637,7 @@ def main():
         ds_train = KneeStudyTrainDataset(df_train, df_series, cfg.TRAIN_IMG_DIR, cfg, is_train=True)
         ld_train = DataLoader(ds_train, batch_size=cfg.BATCH_SIZE, shuffle=False,
                               num_workers=cfg.NUM_WORKERS, pin_memory=True,
-                              collate_fn=None)
+                              collate_fn=collate_fn)
         precompute_and_save(model, ld_train, (cfg.PYTHON_DIR / "train_feats.pt"), cfg)
 
     ds_val = KneeStudyTrainDataset(df_val, df_series, cfg.TRAIN_IMG_DIR, cfg, is_train=False)
@@ -1657,7 +1645,7 @@ def main():
 
     ld_val = DataLoader(ds_val, batch_size=cfg.BATCH_SIZE, shuffle=False,
                         num_workers=cfg.NUM_WORKERS, pin_memory=True,
-                        collate_fn=None)
+                        collate_fn=collate_fn)
     train_cached_ds = CachedEmbeddingDataset("train_feats.pt", cfg,labels_replacement=df_train)
 
     # Calculate split sizes (e.g., 20% validation)
@@ -1697,10 +1685,12 @@ def main():
     criterion = AsymmetricLossOptimized(gamma_neg=3.0, gamma_pos=0.0, clip=0.05)  # AsymmetricLossOptimized(gamma_neg=4.0, gamma_pos=1.0, clip=0.05)#WeightedBCELoss(pos_weight=pos_weights)##nn.BCEWithLogitsLoss()
     best_loss = 100.0
     best_auc = 0
-    writer = SummaryWriter()
+    writer = SummaryWriter(comment=f"LABEL{cfg.TRAINING_LABEL}")
+    patience=10
+    without_save_epochs=0
     for epoch in range(cfg.EPOCHS):
         print(f'\n--- Epoch {epoch + 1}/{cfg.EPOCHS} ---')
-
+        without_save_epochs+=1
         train_loss = train_epoch(model, ld_train, optimizer, criterion, scaler, cfg)
         val_loss, val_auc = eval_epoch(model, ld_val, criterion, cfg)
         val_loss2, val_auc2 = eval_epoch(model, ld_val2, criterion, cfg)
@@ -1719,6 +1709,7 @@ def main():
 
         writer.add_scalar("Params/Learning_Rate", current_lr, epoch)
         if val_loss < best_loss:
+            without_save_epochs = 0
             best_loss = val_loss
             torch.save({
                 'epoch': epoch,
@@ -1729,6 +1720,8 @@ def main():
 
             }, cfg.SAVE_PATH)
             print(f'✓ Checkpoint saved (LOSS: {val_loss:.4f})')
+        if without_save_epochs >= patience:
+            break
         # if val_auc2 > best_auc2:
         #     best_auc2 = val_auc2
         #     torch.save({
@@ -1752,7 +1745,7 @@ def refine_labels():
     ds_val = KneeStudyTrainDataset(df_val, df_series, cfg.TRAIN_IMG_DIR, cfg, is_train=False)
     gold_val = DataLoader(ds_val, batch_size=cfg.BATCH_SIZE, shuffle=False,
                         num_workers=cfg.NUM_WORKERS, pin_memory=True,
-                        collate_fn=None)
+                        collate_fn=collate_fn)
     model = KneeAbnormalityModelRefactored(cfg).to(cfg.DEVICE)
     if cfg.LOAD_PATH.exists():
         loadout = model.load_state_dict(torch.load(cfg.LOAD_PATH, weights_only=True)["model_state_dict"], strict=True)
@@ -1819,8 +1812,9 @@ def refine_labels():
 if __name__ == '__main__':
     #'llm_generated_labels.csv'
     # cfg.TRAIN_CSV=cfg.PYTHON_DIR / "refined_llm_labels.csv"
+    cfg.TRAINING_LABEL = 0
     cfg.SAVE_PATH=cfg.PYTHON_DIR / f"best_model_dino_label0.pth"
-    main()
+    # main()
     cfg.LOAD_PATH=cfg.SAVE_PATH
     refine_labels()
 
