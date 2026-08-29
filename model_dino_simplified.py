@@ -448,6 +448,7 @@ class AttentionPooling(nn.Module):
         self.attn = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.Tanh(),
+            nn.Dropout(0.2),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -458,7 +459,7 @@ class AttentionPooling(nn.Module):
         scores = self.attn(x).squeeze(-1)  # [B, N]
 
         if mask is not None:
-            scores = scores.masked_fill(~mask, -1e9)
+            scores = scores.masked_fill(~mask, -1e8)
 
         weights = F.softmax(scores, dim=-1).unsqueeze(-1)  # [B, N, 1]
         return torch.sum(x * weights, dim=1)  # [B, Feature_Dim]
@@ -479,41 +480,49 @@ class KneeAbnormalityModelRefactored(nn.Module):
         self.fluid_embed = nn.Embedding(2, 4)
         self.fat_embed = nn.Embedding(2, 4)
         meta_dim = 8 + 8 + 4 + 4  # Total: 24
-
+        self.inputdropout=nn.Dropout(0.2)
         # 2. Backbone Feature Projection & Attention Pools
-        self.feature_proj = nn.Linear(768 + meta_dim, 256)
+        self.feature_proj = nn.Sequential(nn.Linear(768*2 + meta_dim, 512),nn.ReLU(),nn.Dropout(0.2),nn.Linear(512,256))
 
         # Slice-level pooling per series
         self.slice_pool = AttentionPooling(in_dim=768, hidden_dim=128)
+        self.slice_conved_pool = AttentionPooling(in_dim=768, hidden_dim=128)
 
+        conv_kernel_size=7
+        self.acl_conv=nn.Sequential(
+            nn.Conv1d(768, 768, conv_kernel_size,padding=conv_kernel_size // 2),
+            nn.BatchNorm1d(768),
+            nn.GELU(),
+            nn.Dropout(0.2),
+        )
         # Pathology-Specific Series Aggregators
-        self.acl_pool = AttentionPooling(in_dim=256, hidden_dim=128)
-        self.mcl_pool = AttentionPooling(in_dim=256, hidden_dim=128)
-        self.mm_pool = AttentionPooling(in_dim=256, hidden_dim=128)
-        self.lm_pool = AttentionPooling(in_dim=256, hidden_dim=128)
-        self.moa_pool = AttentionPooling(in_dim=256, hidden_dim=128)
-        self.loa_pool = AttentionPooling(in_dim=256, hidden_dim=128)
-        self.pfoa_pool = AttentionPooling(in_dim=256, hidden_dim=128)
-        self.effusion_pool = AttentionPooling(in_dim=256, hidden_dim=128)
-        self.synovitis_pool = AttentionPooling(in_dim=256, hidden_dim=128)
-        self.baker_pool = AttentionPooling(in_dim=256, hidden_dim=128)
-        self.contusion_pool = AttentionPooling(in_dim=256, hidden_dim=128)
-        self.fracture_pool = AttentionPooling(in_dim=256, hidden_dim=128)
+        self.acl_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.mcl_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.mm_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.lm_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.moa_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.loa_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.pfoa_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.effusion_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.synovitis_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.baker_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.contusion_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.fracture_pool = AttentionPooling(in_dim=256, hidden_dim=64)
         # self.global_pool = AttentionPooling(in_dim=256, hidden_dim=128)
 
         # Classification Heads
-        self.head_acl = nn.Linear(256, 1)
-        self.head_mcl = nn.Linear(256, 1)
-        self.head_mm = nn.Linear(256, 1)
-        self.head_lm = nn.Linear(256, 1)
-        self.head_moa = nn.Linear(256, 1)
-        self.head_loa = nn.Linear(256, 1)
-        self.head_pfoa = nn.Linear(256, 1)
-        self.head_effusion = nn.Linear(256, 1)
-        self.head_synovitis = nn.Linear(256, 1)
-        self.head_baker = nn.Linear(256, 1)
-        self.head_contusion = nn.Linear(256, 1)
-        self.head_fracture = nn.Linear(256, 1)
+        self.head_acl = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
+        self.head_mcl = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
+        self.head_mm = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
+        self.head_lm = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
+        self.head_moa = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
+        self.head_loa = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
+        self.head_pfoa = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
+        self.head_effusion = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
+        self.head_synovitis = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
+        self.head_baker = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
+        self.head_contusion = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
+        self.head_fracture = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
         # self.head_general = nn.Linear(256, num_labels - 4)
 
     def forward(
@@ -534,12 +543,17 @@ class KneeAbnormalityModelRefactored(nn.Module):
         B, Serie, S, C = features.shape
 
         # 1. Pool Slices per Series using Attention -> [B * Serie, 768]
-        feat_flat = features.view(B * Serie, S, C)
+        feat_flat = self.inputdropout(features.view(B * Serie, S, C))
         s_mask_flat = slice_mask.view(B * Serie, S)
         series_features = self.slice_pool(feat_flat, mask=s_mask_flat).view(
             B, Serie, C
         )
-
+        series_conved=self.acl_conv(feat_flat.transpose(1, 2)).transpose(1, 2)
+        if series_conved.shape[1] != s_mask_flat.shape[1]:
+            pass
+        series_conved_features=self.slice_conved_pool(series_conved, mask=s_mask_flat).view(
+            B, Serie, C
+        )
         # 2. Embed Metadata Properly
         p_emb = self.plane_embed(plane_ids.clamp(0, 3))
         c_emb = self.crop_embed(plane_crop_mixed[:, :, 1].clamp(0, 6))
@@ -549,7 +563,7 @@ class KneeAbnormalityModelRefactored(nn.Module):
         meta_feats = torch.cat([p_emb, c_emb, fl_emb, ft_emb], dim=-1)
 
         # 3. Concatenate Features + Metadata & Project -> [B, Serie, 256]
-        combined = torch.cat([series_features, meta_feats], dim=-1)
+        combined = torch.cat([series_features,series_conved_features, meta_feats], dim=-1)
         series_embeddings = F.relu(self.feature_proj(combined))
         acl_mask = (
             ((plane_crop_mixed[:, :, 1] == 0) | (plane_crop_mixed[:, :, 1] == 1))
