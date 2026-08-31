@@ -29,15 +29,16 @@ from torch.utils.tensorboard import SummaryWriter
 from scipy.ndimage import label, find_objects
 from tqdm import tqdm
 import multiprocessing as mp
-
+from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
+from torch.utils.data import DataLoader, Dataset, RandomSampler, WeightedRandomSampler
 from traitlets import Long
 
-# try:
-#     mp.set_start_method('fork', force=True)
-# except RuntimeError:
-#     pass
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass
 print(torch.__version__)
-from model_dino_simplified import KneeAbnormalityModelWithDinoMulti, pad_image, KneeAbnormalityModelRefactored
+from model_dino_new1 import KneeAbnormalityModelRefactored
 
 torch.set_float32_matmul_precision('high')
 warnings.filterwarnings('ignore')
@@ -57,7 +58,7 @@ class Config:
     LOAD_PATH = PYTHON_DIR / f"best_model_dino_label.pth"
 
     # ── Image processing ──────────────────────────────────────────────
-    MAX_SLICES_PER_SERIES = -1
+    MAX_SLICES_PER_SERIES = 32
     MAX_SERIES_PER_STUDY = 16
     LABELS = ['ACL', 'MCL', 'Medial Meniscus', 'Lateral Meniscus',
               'Medial OA', 'Lateral OA', 'PF OA', 'Effusion',
@@ -75,10 +76,10 @@ class Config:
     DROPOUT = 0.3
 
     # ── Train / val split ─────────────────────────────────────────────
-    VAL_FRACTION = 0.10  # 20% val, 80% train
+    VAL_FRACTION = 0.20  # 20% val, 80% train
 
     # ── Training hyperparameters ──────────────────────────────────────
-    BATCH_SIZE = 4
+    BATCH_SIZE = 16
     NUM_WORKERS = 0
     GRAD_ACCUM_STEPS = 1
     WARMUP_EPOCHS = 5
@@ -92,7 +93,7 @@ class Config:
     SEED = 42
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    LABEL_CLAMP_THRESHOLD = 0.8
+    LABEL_CLAMP_THRESHOLD = 0.5
     LABEL_SMOOTHENING_THRESHOLD = 0.1
 
 
@@ -347,45 +348,8 @@ class KneeStudyTrainDataset(Dataset):
 
     def __init__(self, df_studies: pd.DataFrame, df_series: pd.DataFrame, img_dir: Path, cfg, is_train: bool = True):
         self.cfg = cfg
-        self.vit = timm.create_model("vit_base_patch16_224",
-                                     pretrained=False,
-                                     num_classes=0,
-                                     dynamic_img_size=True,
-                                     checkpoint_path="radiodino/model.safetensors")
-        self.vit.eval()
-        self.vit.requires_grad_(False)
-        self.vit.to(cfg.DEVICE)
-        self.roiextractor = TorchScriptROIExtractor(
-            "yolo_axial.torchscript",
-            "yolo_sagittal.torchscript",
-            "yolo_coronal.torchscript",
-            {
-                "axial": {
-                    0: "whole",
-                    1: "anterior",
-                    2: "medial",
-                    3: "lateral",
-                    4: "back",
-                    5: "front"
-                },
-                "sagittal": {
-                    0: "whole",
-                    1: "anterior",
-                    2: "medial",
-                    3: "lateral",
-                    4: "back",
-                    5: "front"
-                },
-                "coronal": {
-                    0: "whole",
-                    1: "anterior",
-                    2: "medial",
-                    3: "lateral",
-                    4: "back",
-                    5: "front"
-                }
-            }
-        )
+        self.vit = None
+        self.roiextractor = None
         self.img_dir = img_dir
         self.is_train = is_train
         self.cache = {}
@@ -861,14 +825,90 @@ class KneeStudyTrainDataset(Dataset):
             return None
 
     def __getitem__(self, idx):
+        if self.vit is None:
+            self.vit=timm.create_model("vit_base_patch16_224",
+                              pretrained=False,
+                              num_classes=0,
+                              dynamic_img_size=True,
+                              checkpoint_path="radiodino/model.safetensors")
+            self.vit.eval()
+            self.vit.requires_grad_(False)
+            self.vit.to(cfg.DEVICE)
+        if self.roiextractor is None:
+            self.roiextractor=TorchScriptROIExtractor(
+                "yolo_axial.torchscript",
+                "yolo_sagittal.torchscript",
+                "yolo_coronal.torchscript",
+                {
+                    "axial": {
+                        0: "whole",
+                        1: "anterior",
+                        2: "medial",
+                        3: "lateral",
+                        4: "back",
+                        5: "front"
+                    },
+                    "sagittal": {
+                        0: "whole",
+                        1: "anterior",
+                        2: "medial",
+                        3: "lateral",
+                        4: "back",
+                        5: "front"
+                    },
+                    "coronal": {
+                        0: "whole",
+                        1: "anterior",
+                        2: "medial",
+                        3: "lateral",
+                        4: "back",
+                        5: "front"
+                    }
+                }
+            )
         study = self.studies[idx]
         study_id = study['study_id']
         labels = study['labels']
 
+        def identify_sequence_with_binaries(seq_type, fluid_sensitive, fat_suppressed,seq_desc,seq_name):
+            """
+            tr: float (Repetition Time)
+            te: float (Echo Time)
+            ti: float (Inversion Time)
+            fa: float (Flip Angle)
+            seq_type: str (Scanning Sequence tag e.g., 'SE', 'GR', 'IR')
+            fluid_sensitive: bool (Your binary flag)
+            fat_suppressed: bool (Your binary flag)
+            """
+
+            # 1. Isolate STIR instantly using flags
+            if fluid_sensitive and fat_suppressed:
+                # Double check with TI or IR string to ensure it's not a T2-FLAIR
+                if 'IR' in seq_type:
+                    return 5
+
+            # 2. Isolate GRE / T2* (Low flip angle, no fat suppression)
+            if 'GR' in seq_type:
+                return 4
+
+            # 3. Handle Spin Echo (TSE/SE) variants
+            if 'SE' in seq_type:
+                if fluid_sensitive and not fat_suppressed:
+                    return 2
+
+                elif not fluid_sensitive and not fat_suppressed:
+                    if 'pd' in seq_desc.lower():
+                        return 3
+
+                    return 1
+
+
+            return 0
         all_slices = []
         all_plane_ids = []
         all_fluids = []
         all_fats = []
+        all_stype=[]
         for sinfo in study['series']:
             path = self.img_dir / study_id / sinfo['series_id']
             if not path.exists():
@@ -900,30 +940,40 @@ class KneeStudyTrainDataset(Dataset):
             alldcms = sorted_slices
             if self.cfg.MAX_SLICES_PER_SERIES > 0:
                 skipnum = math.ceil(len(alldcms) / self.cfg.MAX_SLICES_PER_SERIES)
-                # for i in range(len(alldcms)):
-                #     if (i % skipnum) == 0:
-                #         dcm_files.append(alldcms[i])
-                #         # if i==0:
-                #         #     dcm_files.append(alldcms[i])
-                #         #     dcm_files.append(alldcms[i+1])
-                #         #     dcm_files.append(alldcms[i+2])
-                #         # elif i==len(alldcms)-1:
-                #         #     dcm_files.append(alldcms[i-2])
-                #         #     dcm_files.append(alldcms[i-1])
-                #         #     dcm_files.append(alldcms[i])
-                #         # else:
-                #         #     dcm_files.append(alldcms[i-1])
-                #         #     dcm_files.append(alldcms[i])
-                #         #     dcm_files.append(alldcms[i+1])
-                middleidx = int(len(alldcms) / 2)
-                onefourth = int(middleidx / 2)
-                threefourth = int(middleidx + onefourth)
-                dcm_files.append(alldcms[onefourth])
-                dcm_files.append(alldcms[middleidx])
-                dcm_files.append(alldcms[threefourth])
+                startidx=0
+                endidx=len(alldcms)
+                slicethickness=float(alldcms[0].SliceThickness)
+                if slicethickness < 2.0:
+                    skipnum = math.ceil(3.0/slicethickness)
+                if len(alldcms)>self.cfg.MAX_SLICES_PER_SERIES*skipnum:
+                    idxoffset=(len(alldcms)-self.cfg.MAX_SLICES_PER_SERIES*skipnum)//2
+                    startidx=idxoffset
+                    endidx=len(alldcms)-idxoffset
+                for i in range(startidx,endidx):
+                    if (i % skipnum) == 0:
+                        dcm_files.append(alldcms[i])
+                        # if i==0:
+                        #     dcm_files.append(alldcms[i])
+                        #     dcm_files.append(alldcms[i+1])
+                        #     dcm_files.append(alldcms[i+2])
+                        # elif i==len(alldcms)-1:
+                        #     dcm_files.append(alldcms[i-2])
+                        #     dcm_files.append(alldcms[i-1])
+                        #     dcm_files.append(alldcms[i])
+                        # else:
+                        #     dcm_files.append(alldcms[i-1])
+                        #     dcm_files.append(alldcms[i])
+                        #     dcm_files.append(alldcms[i+1])
+                # middleidx=int(len(alldcms) / 2)
+                # onefourth=int(middleidx/2)
+                # threefourth=int(middleidx+onefourth)
+                # dcm_files.append(alldcms[onefourth])
+                # dcm_files.append(alldcms[middleidx])
+                # dcm_files.append(alldcms[threefourth])
             else:
                 dcm_files = alldcms
             slices = []
+            imagetypes=[]
             # tempimgs=[]
             for dcm_file in dcm_files:
                 # dcm = pydicom.dcmread(str(dcm_file))
@@ -952,6 +1002,7 @@ class KneeStudyTrainDataset(Dataset):
                     img = np.clip(img, 0.0, 1.0)
                     img = np.stack([img, img, img], axis=0)  # (3, H, W)
                     slices.append(torch.from_numpy(img))
+
                 except:
                     pass
                 # if len(tempimgs)==3:
@@ -961,11 +1012,13 @@ class KneeStudyTrainDataset(Dataset):
             #     toadd=3-len(tempimgs)
             #     newtempimgs=torch.cat([torch.stack(tempimgs,dim=0),torch.zeros(toadd, 518, 518)],dim=0)
             #     slices.append(newtempimgs)
-
+            dcm = dcm_files[0]
+            serietype = identify_sequence_with_binaries(getattr(dcm,"ScanningSequence",""),sinfo['fluid_sensitive'],sinfo['fat_suppression'],getattr(dcm,"SeriesDescription",""),getattr(dcm,"SequenceName",""))
             all_plane_ids.append(sinfo['plane_id'])
             all_fluids.append(sinfo['fluid_sensitive'])
             all_fats.append(sinfo['fat_suppression'])
             all_slices.append(torch.stack(slices))
+            all_stype.append(serietype)
         if study_id not in self.cache:
 
             xxxxxx = [
@@ -999,7 +1052,6 @@ class KneeStudyTrainDataset(Dataset):
                 cropped = input[:, :, minh:maxh, minx:maxx]
                 if cropped.shape[-1] == 0 or cropped.shape[-2] == 0:
                     return None
-                toreturn=None
                 if cropped.shape[-1] < 224 and cropped.shape[-2] < 224:
                     paddingbottom=16-cropped.shape[-2]%16
                     paddingright=16-cropped.shape[-1]%16
@@ -1028,7 +1080,8 @@ class KneeStudyTrainDataset(Dataset):
             new_plane_ids = []
             new_fluids = []
             new_fats = []
-            CHUNK_SIZE = 32  # Process max 32 images at a time through Dino
+            new_stype = []
+            CHUNK_SIZE = 64  # Process max 32 images at a time through Dino
             rev_class_map = {
                 "whole": 0,
                 "anterior": 1,
@@ -1059,6 +1112,7 @@ class KneeStudyTrainDataset(Dataset):
                         new_plane_ids.append(all_plane_ids[idx])
                         new_fluids.append(all_fluids[idx])
                         new_fats.append(all_fats[idx])
+                        new_stype.append(all_stype[idx])
                         tovit.cpu()
                 if "whole" not in x:
                     tovit=crop_and_resize_box(y, torch.tensor([0,1,0,1],dtype=torch.float))
@@ -1080,19 +1134,22 @@ class KneeStudyTrainDataset(Dataset):
                         new_plane_ids.append(all_plane_ids[idx])
                         new_fluids.append(all_fluids[idx])
                         new_fats.append(all_fats[idx])
+                        new_stype.append(all_stype[idx])
                         tovit.cpu()
-            self.cache[study_id] = slices_feats, plane_crop_mixed, new_plane_ids, new_fluids, new_fats
+            self.cache[study_id] = slices_feats, plane_crop_mixed, new_plane_ids, new_fluids, new_fats, new_stype
         else:
-            slices_feats, plane_crop_mixed, new_plane_ids, new_fluids, new_fats = self.cache[study_id]
+            slices_feats, plane_crop_mixed, new_plane_ids, new_fluids, new_fats, new_stype = self.cache[study_id]
         all_plane_ids = new_plane_ids
         all_fluids = new_fluids
         all_fats = new_fats
+        all_stype = new_stype
         if len(all_slices) == 0:
             # Fallback if no images found
             all_slices.append(torch.zeros(3, 224, 224))
             all_plane_ids.append(0)
             all_fluids.append(0)
             all_fats.append(0)
+            all_stype.append(0)
         max_slice = max(slice.shape[0] for slice in all_slices)
         # max_height=max(slices.shape[2] for slices in all_slices)
         # max_width=max(slices.shape[3] for slices in all_slices)
@@ -1124,6 +1181,7 @@ class KneeStudyTrainDataset(Dataset):
             'plane_ids': torch.tensor(all_plane_ids, dtype=torch.long),
             'fluid_sensitive': torch.tensor(all_fluids, dtype=torch.long),
             'fat_suppression': torch.tensor(all_fats, dtype=torch.long),
+            'serie_type': torch.tensor(all_stype, dtype=torch.long),
             'labels': torch.tensor(labels, dtype=torch.float32),
             'plane_crop_mixed': torch.tensor(plane_crop_mixed, dtype=torch.long),
         }
@@ -1137,6 +1195,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
     plane_ids = [x["plane_ids"] for x in batch]
     fluids = [x["fluid_sensitive"] for x in batch]
     fats = [x["fat_suppression"] for x in batch]
+    stype = [x["serie_type"] for x in batch]
     labels = [x["labels"] for x in batch]
     plane_crop_mixed = [x["plane_crop_mixed"] for x in batch]
     maxslicesize = max([slice.shape[1] for slice in slices])
@@ -1146,6 +1205,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
     paddedplane_ids = []
     paddedfluids = []
     paddedfats = []
+    paddedstype = []
     paddedplane_crop_mixed = []
     seriemasks = []
 
@@ -1157,6 +1217,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
         newfat = fats[i]
         newplane_crop_mixed = plane_crop_mixed[i]
         newseriemask = torch.ones_like(newplane_id, dtype=torch.bool)
+        newstype = stype[i]
         if newslice.shape[1] < maxslicesize:
             slicediffer = maxslicesize - newslice.shape[1]
             newslice = torch.cat([newslice, torch.zeros((newslice.shape[0], slicediffer, newslice.shape[-1]))], dim=1)
@@ -1172,6 +1233,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
             newplane_id = torch.cat((newplane_id, paddingones * 10.0), dim=0)
             newfluid = torch.cat((newfluid, paddingones * 10.0), dim=0)
             newfat = torch.cat((newfat, paddingones * 10.0), dim=0)
+            newstype = torch.cat((newstype, paddingones * 10.0), dim=0)
             newseriemask = torch.cat((newseriemask, torch.zeros(seriediffer, dtype=torch.bool)), dim=0)
             newplane_crop_mixed = torch.cat((newplane_crop_mixed, torch.ones((seriediffer, 2)) * 10.0), dim=0)
         paddedslices.append(newslice)
@@ -1180,6 +1242,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
         paddedfluids.append(newfluid)
         paddedfats.append(newfat)
         seriemasks.append(newseriemask)
+        paddedstype.append(newstype)
         paddedplane_crop_mixed.append(newplane_crop_mixed)
     return {
         "study_id": studies,
@@ -1188,6 +1251,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
         "plane_ids": torch.stack(paddedplane_ids, dim=0).long(),
         "fluid_sensitive": torch.stack(paddedfluids, dim=0).long(),
         "fat_suppression": torch.stack(paddedfats, dim=0).long(),
+        "serie_type": torch.stack(paddedstype, dim=0).long(),
         "seriemasks": torch.stack(seriemasks, dim=0),
         "slices": torch.stack(paddedslices, dim=0),
         "plane_crop_mixed": torch.stack(paddedplane_crop_mixed, dim=0).long(),
@@ -1230,9 +1294,9 @@ def train_epoch(model, loader, optimizer, criterion, scaler, cfg):
         # fluid_sensitive = batch['fluid_sensitive'].to(cfg.DEVICE)
         # fat_suppression = batch['fat_suppression'].to(cfg.DEVICE)
         labels = batch["labels"].to(cfg.DEVICE)[:,cfg.TRAINING_LABEL]
-
-        labels[labels >= cfg.LABEL_CLAMP_THRESHOLD] = 1.0
-        labels[labels < cfg.LABEL_CLAMP_THRESHOLD] = 0.0
+        labelsmasks=(labels >= cfg.LABEL_CLAMP_THRESHOLD)
+        labels[labelsmasks] = 1.0
+        labels[~labelsmasks] = 0.0
         slices = batch["slices"].to(cfg.DEVICE)
         slicemasks = batch["slicemasks"].to(cfg.DEVICE)
         fats = batch["fat_suppression"].to(cfg.DEVICE)
@@ -1240,6 +1304,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler, cfg):
         plane_ids = batch["plane_ids"].to(cfg.DEVICE)
         plane_crop_mixed = batch["plane_crop_mixed"].to(cfg.DEVICE)
         seriemasks = batch["seriemasks"].to(cfg.DEVICE) if "seriemasks" in batch else slicemasks[:, :, 0]
+        serietype=batch["serie_type"].to(cfg.DEVICE)
 
         if torch.isnan(slices).any():
             print(
@@ -1249,7 +1314,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler, cfg):
             # optimizer.zero_grad()
             if cfg.USE_AMP:
                 with torch.amp.autocast("cuda", dtype=torch.float16):
-                    logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed)[:,cfg.TRAINING_LABEL]
+                    logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)[:,cfg.TRAINING_LABEL]
                     loss = criterion(logits, labels)
                     loss = loss / cfg.GRAD_ACCUM_STEPS
 
@@ -1259,7 +1324,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler, cfg):
                     scaler.update()
                     optimizer.zero_grad()
             else:
-                logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed)[:,cfg.TRAINING_LABEL]
+                logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)[:,cfg.TRAINING_LABEL]
 
                 loss = criterion(logits, labels)
                 loss = loss / cfg.GRAD_ACCUM_STEPS
@@ -1294,6 +1359,9 @@ def eval_epoch(model, loader, criterion, cfg):
 
         # Target label shape: (B,)
         labels = batch["labels"].to(cfg.DEVICE)[:,cfg.TRAINING_LABEL]
+        labelsmasks=(labels >= cfg.LABEL_CLAMP_THRESHOLD)
+        labels[labelsmasks] = 1.0
+        labels[~labelsmasks] = 0.0
         slices = batch["slices"].to(cfg.DEVICE)
         slicemasks = batch["slicemasks"].to(cfg.DEVICE)
         fats = batch["fat_suppression"].to(cfg.DEVICE)
@@ -1301,11 +1369,12 @@ def eval_epoch(model, loader, criterion, cfg):
         plane_ids = batch["plane_ids"].to(cfg.DEVICE)
         plane_crop_mixed = batch["plane_crop_mixed"].to(cfg.DEVICE)
         seriemasks = batch["seriemasks"].to(cfg.DEVICE) if "seriemasks" in batch else slicemasks[:, :, 0]
+        serietype=batch["serie_type"].to(cfg.DEVICE)
         if cfg.USE_AMP:
             with torch.amp.autocast("cuda", dtype=torch.float16):
-                logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed)[:,cfg.TRAINING_LABEL]
+                logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)[:,cfg.TRAINING_LABEL]
         else:
-            logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed)[:,cfg.TRAINING_LABEL]
+            logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)[:,cfg.TRAINING_LABEL]
 
         # Cast logits to float32 for numerically stable loss calculation
         loss = criterion(logits.float(), labels)
@@ -1408,6 +1477,7 @@ from tqdm import tqdm
 class CachedEmbeddingDataset(torch.utils.data.Dataset):
 
     def __init__(self, pt_file, cfg,label_filter=True,labels_replacement=None):
+        self.valid_masks=None
         data = torch.load(pt_file)
         studies = data["study_id"]  # Tensor shape: (N, 264)
         slices = data["slices"]  # Tensor shape: (N, 264)
@@ -1415,6 +1485,7 @@ class CachedEmbeddingDataset(torch.utils.data.Dataset):
         plane_ids = data["plane_ids"]  # Tensor shape: (N, 264)
         fluids = data["fluid_sensitive"]  # Tensor shape: (N, 264)
         fats = data["fat_suppression"]  # Tensor shape: (N, 264)
+        stypes=data["serie_type"]
         if labels_replacement is None:
             labels = data["labels"]
             labels = torch.cat(labels, dim=0)  # Tensor shape: (N, 12)
@@ -1427,7 +1498,7 @@ class CachedEmbeddingDataset(torch.utils.data.Dataset):
 
         plane_crop_mixed = data["plane_crop_mixed"]
         if label_filter:
-            mask = (labels[:, cfg.TRAINING_LABEL] >= 0.90) | (labels[:, cfg.TRAINING_LABEL] <= 0.15)
+            mask = (labels[:, cfg.TRAINING_LABEL] >= 0.99) | (labels[:, cfg.TRAINING_LABEL] <= 0.15)
         else:
             mask=torch.ones(labels.shape[0], dtype=torch.bool)
         masknp=mask.numpy()
@@ -1438,6 +1509,7 @@ class CachedEmbeddingDataset(torch.utils.data.Dataset):
         self.plane_ids = []
         self.fluids = []
         self.fats = []
+        self.stype = []
         self.labels = []
         self.plane_crop_mixed = []
         # for i in range(len(features)):
@@ -1467,6 +1539,7 @@ class CachedEmbeddingDataset(torch.utils.data.Dataset):
             self.fats.append(fats[i].squeeze(0))
             self.labels.append(labels[i].squeeze(0))
             self.plane_crop_mixed.append(plane_crop_mixed[i].squeeze(0))
+            self.stype.append(stypes[i].squeeze(0))
         # self.features = features[mask]  # Tensor shape: (N, 264)
         # self.labels = labels  # Tensor shape: (N, 12)
         print(f"Nanslices: {nanslices}")
@@ -1476,7 +1549,7 @@ class CachedEmbeddingDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         return self.studies[idx], self.slices[idx], self.slicemasks[idx], self.plane_ids[idx], self.fluids[idx], \
-        self.fats[idx], self.labels[idx], self.plane_crop_mixed[idx]
+        self.fats[idx], self.labels[idx], self.plane_crop_mixed[idx], self.stype[idx], self.valid_masks[idx] if self.valid_masks is not None else None
 
 
 def cache_collate_fn(batch):
@@ -1488,6 +1561,8 @@ def cache_collate_fn(batch):
     fats = [x[5] for x in batch]
     labels = [x[6] for x in batch]
     plane_crop_mixed = [x[7] for x in batch]
+    stype = [x[8] for x in batch]
+    valid_masks=[x[9] for x in batch]
     maxslicesize = max([slice.shape[1] for slice in slices])
     maxseriesize = max([slice.shape[0] for slice in slices])
     paddedslices = []
@@ -1495,6 +1570,7 @@ def cache_collate_fn(batch):
     paddedplane_ids = []
     paddedfluids = []
     paddedfats = []
+    paddedstype=[]
     paddedplane_crop_mixed = []
     seriemasks = []
 
@@ -1505,6 +1581,7 @@ def cache_collate_fn(batch):
         newfluid = fluids[i]
         newfat = fats[i]
         newplane_crop_mixed = plane_crop_mixed[i]
+        newstype = stype[i]
         newseriemask = torch.ones_like(newplane_id, dtype=torch.bool)
         if newslice.shape[1] < maxslicesize:
             slicediffer = maxslicesize - newslice.shape[1]
@@ -1521,6 +1598,7 @@ def cache_collate_fn(batch):
             newplane_id = torch.cat((newplane_id, paddingones * 10.0), dim=0)
             newfluid = torch.cat((newfluid, paddingones * 10.0), dim=0)
             newfat = torch.cat((newfat, paddingones * 10.0), dim=0)
+            newstype = torch.cat((newstype, paddingones * 10.0), dim=0)
             newseriemask = torch.cat((newseriemask, torch.zeros(seriediffer, dtype=torch.bool)), dim=0)
             newplane_crop_mixed = torch.cat((newplane_crop_mixed, torch.ones((seriediffer, 2)) * 10.0), dim=0)
         paddedslices.append(newslice)
@@ -1529,6 +1607,7 @@ def cache_collate_fn(batch):
         paddedfluids.append(newfluid)
         paddedfats.append(newfat)
         seriemasks.append(newseriemask)
+        paddedstype.append(newstype)
         paddedplane_crop_mixed.append(newplane_crop_mixed)
     return {
         "study_id": studies,
@@ -1540,6 +1619,8 @@ def cache_collate_fn(batch):
         "seriemasks": torch.stack(seriemasks, dim=0),
         "slices": torch.stack(paddedslices, dim=0),
         "plane_crop_mixed": torch.stack(paddedplane_crop_mixed, dim=0).long(),
+        "serie_type": torch.stack(paddedstype, dim=0).long(),
+        "valid_masks": torch.stack(valid_masks, dim=0) if valid_masks[0] is not None else None,
     }
     pass
 
@@ -1547,7 +1628,7 @@ def cache_collate_fn(batch):
 @torch.no_grad()
 def precompute_and_save(model, loader, save_path, cfg):
     model.eval()
-    all_labels, all_study, all_slice, all_masks, all_plane_ids, all_fluid, all_fat, all_planecrop = [], [], [], [], [], [], [], []
+    all_labels, all_study, all_slice, all_masks, all_plane_ids, all_fluid, all_fat, all_planecrop, all_stype = [], [], [], [], [], [], [], [], []
 
     for batch in tqdm(loader, desc="Caching Features"):
         #
@@ -1562,15 +1643,16 @@ def precompute_and_save(model, loader, save_path, cfg):
         #         newfeats.append(feats[i].cpu())
         #     else:
         #         newfeats.append(feats[i])
-
-        all_labels.append(batch["labels"].cpu())
-        all_study.append(batch["study_id"])
-        all_slice.append(batch["slices"].cpu())
-        all_masks.append(batch["slicemasks"].cpu())
-        all_plane_ids.append(batch["plane_ids"].cpu())
-        all_fluid.append(batch["fluid_sensitive"].cpu())
-        all_fat.append(batch["fat_suppression"].cpu())
-        all_planecrop.append(batch["plane_crop_mixed"].cpu())
+        for i in range(len(batch["study_id"])):
+            all_labels.append(batch["labels"][i].unsqueeze(0).cpu())
+            all_study.append([batch["study_id"][i]])
+            all_slice.append(batch["slices"][i].unsqueeze(0).cpu())
+            all_masks.append(batch["slicemasks"][i].unsqueeze(0).cpu())
+            all_plane_ids.append(batch["plane_ids"][i].unsqueeze(0).cpu())
+            all_fluid.append(batch["fluid_sensitive"][i].unsqueeze(0).cpu())
+            all_fat.append(batch["fat_suppression"][i].unsqueeze(0).cpu())
+            all_planecrop.append(batch["plane_crop_mixed"][i].unsqueeze(0).cpu())
+            all_stype.append(batch["serie_type"][i].unsqueeze(0).cpu())
 
     torch.save(
         {
@@ -1582,6 +1664,7 @@ def precompute_and_save(model, loader, save_path, cfg):
             "slices": all_slice,  # Tensor shape: (N, 264)
             "labels": all_labels,
             "plane_crop_mixed": all_planecrop,
+            "serie_type": all_stype,
         },
         save_path,
     )
@@ -1662,26 +1745,26 @@ def main():
     num_positives = 0
     num_negatives = 0
 
-    # Set num_workers > 0 for faster iteration
-    for batch in tqdm(ld_train, desc="Counting labels"):
-        # Extract target tensor (adjust key/index based on your DataLoader return signature)
-        targets = batch["labels"] if isinstance(batch, dict) else batch[1]
-
-        # If single-label output shape is [B, 1] or [B]
-        targets = targets[:,cfg.TRAINING_LABEL].view(-1)
-        targets[targets >= 0.50] = 1.0
-        targets[targets < 0.50] = 0.0
-        # For strict binary targets (0 or 1):
-        num_positives += (targets == 1).sum().item()
-        num_negatives += (targets == 0).sum().item()
-
-        # NOTE: If using smoothed targets (e.g., 0.05 / 0.95), threshold at 0.5:
-        # num_positives += (targets > 0.5).sum().item()
-        # num_negatives += (targets <= 0.5).sum().item()
-
-
-    print(f"Positives: {num_positives} | Negatives: {num_negatives}")
-    pos_weight = torch.tensor([num_negatives / num_positives]).to(cfg.DEVICE)
+    # # Set num_workers > 0 for faster iteration
+    # for batch in tqdm(ld_train, desc="Counting labels"):
+    #     # Extract target tensor (adjust key/index based on your DataLoader return signature)
+    #     targets = batch["labels"] if isinstance(batch, dict) else batch[1]
+    #
+    #     # If single-label output shape is [B, 1] or [B]
+    #     targets = targets[:,cfg.TRAINING_LABEL].view(-1)
+    #     targets[targets >= 0.50] = 1.0
+    #     targets[targets < 0.50] = 0.0
+    #     # For strict binary targets (0 or 1):
+    #     num_positives += (targets == 1).sum().item()
+    #     num_negatives += (targets == 0).sum().item()
+    #
+    #     # NOTE: If using smoothed targets (e.g., 0.05 / 0.95), threshold at 0.5:
+    #     # num_positives += (targets > 0.5).sum().item()
+    #     # num_negatives += (targets <= 0.5).sum().item()
+    #
+    #
+    # print(f"Positives: {num_positives} | Negatives: {num_negatives}")
+    # pos_weight = torch.tensor([num_negatives / num_positives]).to(cfg.DEVICE)
     criterion = AsymmetricLossOptimized(gamma_neg=3.0, gamma_pos=0.0, clip=0.05)  # AsymmetricLossOptimized(gamma_neg=4.0, gamma_pos=1.0, clip=0.05)#WeightedBCELoss(pos_weight=pos_weights)##nn.BCEWithLogitsLoss()
     best_loss = 100.0
     best_auc = 0
@@ -1692,6 +1775,8 @@ def main():
         print(f'\n--- Epoch {epoch + 1}/{cfg.EPOCHS} ---')
         without_save_epochs+=1
         train_loss = train_epoch(model, ld_train, optimizer, criterion, scaler, cfg)
+        train_loss2 = train_epoch(model, ld_val2, optimizer, criterion, scaler, cfg)
+        train_loss=(train_loss+train_loss2)/2
         val_loss, val_auc = eval_epoch(model, ld_val, criterion, cfg)
         val_loss2, val_auc2 = eval_epoch(model, ld_val2, criterion, cfg)
         current_lr = optimizer.param_groups[0]["lr"]
@@ -1767,11 +1852,12 @@ def refine_labels():
         plane_ids = batch["plane_ids"].to(cfg.DEVICE)
         plane_crop_mixed = batch["plane_crop_mixed"].to(cfg.DEVICE)
         seriemasks = batch["seriemasks"].to(cfg.DEVICE) if "seriemasks" in batch else slicemasks[:, :, 0]
+        serietype= batch["serie_type"].to(cfg.DEVICE)
         if cfg.USE_AMP:
             with torch.amp.autocast("cuda", dtype=torch.float16):
-                logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed)[:,cfg.TRAINING_LABEL]
+                logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)[:,cfg.TRAINING_LABEL]
         else:
-            logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed)[:,cfg.TRAINING_LABEL]
+            logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)[:,cfg.TRAINING_LABEL]
         preds = torch.sigmoid(logits).cpu().numpy()
         labels=labels.cpu().numpy()
         for x,y,study in zip(preds,labels,studies):
@@ -1794,11 +1880,12 @@ def refine_labels():
         plane_ids = batch["plane_ids"].to(cfg.DEVICE)
         plane_crop_mixed = batch["plane_crop_mixed"].to(cfg.DEVICE)
         seriemasks = batch["seriemasks"].to(cfg.DEVICE) if "seriemasks" in batch else slicemasks[:, :, 0]
+        serietype= batch["serie_type"].to(cfg.DEVICE)
         if cfg.USE_AMP:
             with torch.amp.autocast("cuda", dtype=torch.float16):
-                logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed)[:,cfg.TRAINING_LABEL]
+                logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)[:,cfg.TRAINING_LABEL]
         else:
-            logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed)[:,cfg.TRAINING_LABEL]
+            logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)[:,cfg.TRAINING_LABEL]
         preds = torch.sigmoid(logits).cpu().numpy()
         labels=labels.cpu().numpy()
         for x,y,study in zip(preds,labels,studies):
@@ -1806,15 +1893,271 @@ def refine_labels():
                 updates[study]=x
         pass
     df_train[cfg.LABELS[cfg.TRAINING_LABEL]] = df_train["StudyInstanceUID"].map(updates).fillna(df_train[cfg.LABELS[cfg.TRAINING_LABEL]])
-    df_train.to_csv(cfg.PYTHON_DIR / "refined_llm_labels.csv", index=False)
+    df_train.to_csv(cfg.PYTHON_DIR / "refined_llm_labels00000.csv", index=False)
 
+
+# ==========================================
+# 1. HELPER: DYNAMIC THRESHOLD PSEUDO-LABELING
+# ==========================================
+@torch.no_grad()
+def generate_pseudo_labels(teacher_model, unlabeled_loader, device, pos_percentile=85, neg_percentile=15):
+    """
+    Runs Teacher inference on the 99% unlabeled dataset.
+    Calculates per-class percentiles to create binary targets and a loss mask.
+    """
+    teacher_model.eval()
+    all_probs = []
+
+    for batch in tqdm(unlabeled_loader, desc="[Teacher] Generating Pseudo-Labels"):
+        # feats = batch["feats"].to(device) if isinstance(batch, dict) else batch[0].to(device)
+        labels = batch["labels"].to(cfg.DEVICE)[:,cfg.TRAINING_LABEL]
+        labelsmasks=(labels >= cfg.LABEL_CLAMP_THRESHOLD)
+        labels[labelsmasks] = 1.0
+        labels[~labelsmasks] = 0.0
+        slices = batch["slices"].to(cfg.DEVICE)
+        slicemasks = batch["slicemasks"].to(cfg.DEVICE)
+        fats = batch["fat_suppression"].to(cfg.DEVICE)
+        fluids = batch["fluid_sensitive"].to(cfg.DEVICE)
+        plane_ids = batch["plane_ids"].to(cfg.DEVICE)
+        plane_crop_mixed = batch["plane_crop_mixed"].to(cfg.DEVICE)
+        seriemasks = batch["seriemasks"].to(cfg.DEVICE) if "seriemasks" in batch else slicemasks[:, :, 0]
+        serietype=batch["serie_type"].to(cfg.DEVICE)
+        logits = teacher_model(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)
+        probs = torch.sigmoid(logits)
+        all_probs.append(probs.cpu())
+
+    all_probs = torch.cat(all_probs, dim=0).numpy()  # Shape: [N_unlabeled, 12]
+    num_classes = all_probs.shape[1]
+
+    pseudo_labels = np.zeros_like(all_probs, dtype=np.float32)
+    valid_mask = np.zeros_like(all_probs, dtype=np.float32)  # 1.0 if confident, 0.0 if masked
+
+    # Per-class dynamic thresholding
+    for k in range(num_classes):
+        tau_pos = np.percentile(all_probs[:, k], pos_percentile)
+        tau_neg = np.percentile(all_probs[:, k], neg_percentile)
+
+        pos_indices = all_probs[:, k] >= tau_pos
+        neg_indices = all_probs[:, k] <= tau_neg
+
+        pseudo_labels[pos_indices, k] = 1.0
+        pseudo_labels[neg_indices, k] = 0.0
+
+        valid_mask[pos_indices | neg_indices, k] = 1.0
+
+    return torch.tensor(pseudo_labels), torch.tensor(valid_mask)
+
+
+# ==========================================
+# 2. HELPER: STUDENT MASKED LOSS STEP
+# ==========================================
+def compute_student_loss(criterion, student_logits, targets, valid_mask=None):
+    """
+    Computes loss. For golden data, valid_mask is 1s.
+    For pseudo-labeled data, masks out uncertain predictions.
+    """
+    # Ensure criterion outputs unreduced loss [B, 12]
+    elementwise_loss = criterion(student_logits, targets)
+
+    if valid_mask is not None:
+        elementwise_loss = elementwise_loss * valid_mask.to(student_logits.device)
+        return elementwise_loss.sum() / (valid_mask.sum() + 1e-8)
+
+    return elementwise_loss.mean()
+
+
+# ==========================================
+# 3. MAIN NOISY STUDENT PIPELINE FUNCTION
+# ==========================================
+def run_noisy_student_pipeline(cfg):
+    print("=== Starting Noisy Student / Iterative Pseudo-Labeling Pipeline ===")
+    writer = SummaryWriter(comment="_NoisyStudent")
+
+    # ---------------------------------------------------------
+    # STEP 1: Load and Stratify Golden Set (N=58) & LLM Set (N=4139)
+    # ---------------------------------------------------------
+    df_gold_all = pd.read_csv(cfg.VAL_CSV)  # 58 Pristine Golden Samples
+    df_unlabeled_all = pd.read_csv(cfg.TRAIN_CSV)  # 4,139 LLM-labeled Samples
+
+    df_series = pd.read_csv(cfg.SERIES_CSV)
+    # Filter overlap if present
+    df_unlabeled = df_unlabeled_all[
+        ~df_unlabeled_all["StudyInstanceUID"].isin(df_gold_all["StudyInstanceUID"])].reset_index(drop=True)
+
+    # Multi-label Stratified 80/20 Split on 58 Golden Samples
+    mskf = MultilabelStratifiedKFold(n_splits=5, shuffle=True, random_state=cfg.SEED)
+    labels_matrix = df_gold_all[cfg.LABELS].values
+
+    train_idx, val_idx = next(mskf.split(df_gold_all, labels_matrix))
+    df_gold_train = df_gold_all.iloc[train_idx].reset_index(drop=True)  # ~46 samples
+    df_gold_val = df_gold_all.iloc[val_idx].reset_index(drop=True)  # ~12 samples
+
+    print(
+        f"Golden Train: {len(df_gold_train)} | Golden Val (Pristine): {len(df_gold_val)} | Unlabeled Pool: {len(df_unlabeled)}")
+
+    # Load Cached Embedding Datasets
+    ds_gold_train = KneeStudyTrainDataset(df_gold_train,df_series,cfg.TRAIN_IMG_DIR, cfg)
+    ds_gold_val = KneeStudyTrainDataset(df_gold_val,df_series,cfg.TRAIN_IMG_DIR, cfg)
+    ds_unlabeled = CachedEmbeddingDataset("train_feats.pt", cfg, labels_replacement=df_unlabeled)
+
+    ld_gold_val = DataLoader(ds_gold_val, batch_size=16, shuffle=False, collate_fn=collate_fn)
+    ld_unlabeled_eval = DataLoader(ds_unlabeled, batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=cache_collate_fn)
+
+    criterion = AsymmetricLossOptimized(gamma_neg=3.0, gamma_pos=0.0, clip=0.05)
+
+    # ---------------------------------------------------------
+    # STEP 2: Warm-Start Teacher Model (M_0)
+    # ---------------------------------------------------------
+    print("\n--- Phase 1: Pre-training Baseline Teacher (M_0) on LLM Set ---")
+    teacher_model = KneeAbnormalityModelRefactored(cfg).to(cfg.DEVICE)
+
+    # Quick pre-train on LLM data
+    ld_unlabeled_train = DataLoader(ds_unlabeled, batch_size=32, shuffle=True, collate_fn=cache_collate_fn)
+    opt_teacher = torch.optim.AdamW(teacher_model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+    scaler = torch.amp.GradScaler(cfg.DEVICE)
+
+    for ep in range(3):  # 3 fast epochs on LLM data
+        train_epoch(teacher_model, ld_unlabeled_train, opt_teacher, criterion, scaler, cfg)
+
+    print("--- Phase 2: Fine-tuning Teacher (M_0) on Golden Train Set (~46 samples) ---")
+    ld_gold_train = DataLoader(ds_gold_train, batch_size=8, shuffle=True, collate_fn=collate_fn)
+    opt_teacher_ft = torch.optim.AdamW(teacher_model.parameters(), lr=1e-5, weight_decay=cfg.WEIGHT_DECAY)
+
+    for ep in range(10):  # Fine-tune gently on golden train
+        train_epoch(teacher_model, ld_gold_train, opt_teacher_ft, criterion, scaler, cfg)
+
+    # Evaluate Initial Teacher on Pristine Golden Val
+    best_val_loss, best_val_auc = eval_epoch(teacher_model, ld_gold_val, criterion, cfg)
+    print(f"Initial Teacher M_0 | Pristine Val AUC: {best_val_auc:.4f} | Val Loss: {best_val_loss:.4f}")
+
+    torch.save({'model_state_dict': teacher_model.state_dict()}, cfg.SAVE_PATH)
+
+    # ---------------------------------------------------------
+    # STEP 3: Iterative Noisy Student Training Loop
+    # ---------------------------------------------------------
+    NUM_STUDENT_ITERATIONS = 3
+
+    for iteration in range(1, NUM_STUDENT_ITERATIONS + 1):
+        print(f"\n==================================================")
+        print(f"       NOISY STUDENT ITERATION {iteration}/{NUM_STUDENT_ITERATIONS}")
+        print(f"==================================================")
+
+        # 1. Teacher generates pseudo-labels for 99% unlabeled pool
+        pseudo_labels, valid_masks = generate_pseudo_labels(
+            teacher_model, ld_unlabeled_eval, cfg.DEVICE, pos_percentile=85, neg_percentile=15
+        )
+
+        # Create Pseudo Dataset with dynamic target replacements
+        ds_pseudo = CachedEmbeddingDataset("train_feats.pt", cfg, labels_replacement=df_unlabeled)
+        ds_pseudo.labels = pseudo_labels  # Inject pseudo targets
+        ds_pseudo.valid_masks = valid_masks  # Inject loss mask
+
+        # Dateloaders: Oversample Golden Train Set (30% Gold, 70% Pseudo)
+        ld_student_gold = DataLoader(ds_gold_train, batch_size=4, shuffle=True, collate_fn=collate_fn)
+        ld_student_pseudo = DataLoader(ds_pseudo, batch_size=12, shuffle=True, collate_fn=cache_collate_fn)
+
+        # 2. Instantiate New Student Model (M_student) with increased noise/dropout
+        student_model = KneeAbnormalityModelRefactored(cfg).to(cfg.DEVICE)
+        student_model.load_state_dict(teacher_model.state_dict())  # Inherit weights
+
+        # Inject Model Noise (increase dropout rate on head)
+        if hasattr(student_model, 'classifier'):
+            student_model.classifier.dropout = nn.Dropout(p=0.4)
+
+        opt_student = torch.optim.AdamW(student_model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+        scheduler = CosineAnnealingLR(opt_student, T_max=cfg.EPOCHS, eta_min=cfg.MIN_LR)
+
+        # 3. Train Student Model
+        student_model.train()
+        for epoch in range(cfg.EPOCHS):
+            total_loss = 0.0
+            steps = 0
+
+            # Simultaneous batch iteration over Gold and Pseudo loaders
+            for batch_gold, batch_pseudo in zip(ld_student_gold, ld_student_pseudo):
+                opt_student.zero_grad()
+                labels = batch_gold["labels"].to(cfg.DEVICE)[:, cfg.TRAINING_LABEL]
+                labelsmasks = (labels >= cfg.LABEL_CLAMP_THRESHOLD)
+                labels[labelsmasks] = 1.0
+                labels[~labelsmasks] = 0.0
+                slices = batch_gold["slices"].to(cfg.DEVICE)
+                slicemasks = batch_gold["slicemasks"].to(cfg.DEVICE)
+                fats = batch_gold["fat_suppression"].to(cfg.DEVICE)
+                fluids = batch_gold["fluid_sensitive"].to(cfg.DEVICE)
+                plane_ids = batch_gold["plane_ids"].to(cfg.DEVICE)
+                plane_crop_mixed = batch_gold["plane_crop_mixed"].to(cfg.DEVICE)
+                seriemasks = batch_gold["seriemasks"].to(cfg.DEVICE) if "seriemasks" in batch_gold else slicemasks[:, :, 0]
+                serietype = batch_gold["serie_type"].to(cfg.DEVICE)
+                # --- Golden Batch Step ---
+                targets_g = labels
+                logits_g = student_model(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)[:, cfg.TRAINING_LABEL]
+                loss_gold = criterion(logits_g, targets_g).mean()
+
+                labels = batch_pseudo["labels"].to(cfg.DEVICE)[:, cfg.TRAINING_LABEL]
+                labelsmasks = (labels >= cfg.LABEL_CLAMP_THRESHOLD)
+                labels[labelsmasks] = 1.0
+                labels[~labelsmasks] = 0.0
+                slices = batch_pseudo["slices"].to(cfg.DEVICE)
+                slicemasks = batch_pseudo["slicemasks"].to(cfg.DEVICE)
+                fats = batch_pseudo["fat_suppression"].to(cfg.DEVICE)
+                fluids = batch_pseudo["fluid_sensitive"].to(cfg.DEVICE)
+                plane_ids = batch_pseudo["plane_ids"].to(cfg.DEVICE)
+                plane_crop_mixed = batch_pseudo["plane_crop_mixed"].to(cfg.DEVICE)
+                seriemasks = batch_pseudo["seriemasks"].to(cfg.DEVICE) if "seriemasks" in batch_pseudo else slicemasks[:, :, 0]
+                serietype = batch_pseudo["serie_type"].to(cfg.DEVICE)
+                # --- Pseudo Batch Step (With Masking & Feature Noise) ---
+                targets_p = labels
+                mask_p = batch_pseudo["valid_masks"].to(cfg.DEVICE)
+
+                # Inject Input/Feature Noise: Random Feature Dropout (0.10)
+                # feats_p_noisy = torch.nn.functional.dropout(feats_p, p=0.10, training=True)
+
+                logits_p = student_model(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)[:, cfg.TRAINING_LABEL]
+                loss_pseudo = compute_student_loss(criterion, logits_p, targets_p, mask_p)
+
+                # Combined Loss
+                loss_batch = loss_gold + (1.0 * loss_pseudo)
+
+                loss_batch.backward()
+                opt_student.step()
+
+                total_loss += loss_batch.item()
+                steps += 1
+
+            scheduler.step()
+
+        # 4. Evaluate Student on Pristine Golden Validation Set
+        val_loss, val_auc = eval_epoch(student_model, ld_gold_val, criterion, cfg)
+        print(f"Iteration {iteration} Student | Pristine Val AUC: {val_auc:.4f} | Val Loss: {val_loss:.4f}")
+
+        writer.add_scalar("NoisyStudent/Val_AUC", val_auc, iteration)
+        writer.add_scalar("NoisyStudent/Val_Loss", val_loss, iteration)
+
+        # 5. Evaluate Promotion Criteria
+        if val_auc > best_val_auc:
+            print(
+                f"✓ Student M_{iteration} outperformed Teacher! Promoting to new Teacher (AUC: {best_val_auc:.4f} -> {val_auc:.4f})")
+            best_val_auc = val_auc
+            best_val_loss = val_loss
+
+            # Promote Student to Teacher (Weights copied directly)
+            teacher_model.load_state_dict(student_model.state_dict())
+            torch.save({'model_state_dict': teacher_model.state_dict(), 'val_auc': val_auc}, cfg.SAVE_PATH)
+        else:
+            print(
+                f"x Student M_{iteration} did not improve over Teacher (AUC: {val_auc:.4f} vs Best: {best_val_auc:.4f}). Stopping iteration loop.")
+            break
+
+    print(f"\nPipeline Finished! Best Model Pristine AUC: {best_val_auc:.4f}")
+    writer.close()
 
 if __name__ == '__main__':
     #'llm_generated_labels.csv'
     # cfg.TRAIN_CSV=cfg.PYTHON_DIR / "refined_llm_labels.csv"
+    # run_noisy_student_pipeline(cfg)
     cfg.TRAINING_LABEL = 0
     cfg.SAVE_PATH=cfg.PYTHON_DIR / f"best_model_dino_label0.pth"
-    # main()
+    main()
     cfg.LOAD_PATH=cfg.SAVE_PATH
     refine_labels()
 
