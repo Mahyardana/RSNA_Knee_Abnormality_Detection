@@ -28,7 +28,7 @@ def extract_and_split_descriptions(root_dir):
             if dcm_files:
                 try:
                     dcm_data = pydicom.dcmread(dcm_files[0], stop_before_pixels=True)
-                    description = getattr(dcm_data, 'SeriesDescription', None)
+                    description = getattr(dcm_data, 'ScanningSequence', None)
                 except Exception:
                     pass
 
@@ -37,7 +37,7 @@ def extract_and_split_descriptions(root_dir):
                 description = series_dir.name
 
             # Split on underscore and hyphen delimiters, removing empty strings
-            tokens = [t.strip() for t in re.split(r'[_,-]', description) if t.strip()]
+            tokens = [f"{description}"]#[t.strip() for t in re.split(r'[_,-]', description) if t.strip()]
 
             record = {
                 'study_id': study_dir.name,

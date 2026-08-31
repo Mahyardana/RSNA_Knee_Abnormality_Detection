@@ -463,7 +463,32 @@ class AttentionPooling(nn.Module):
 
         weights = F.softmax(scores, dim=-1).unsqueeze(-1)  # [B, N, 1]
         return torch.sum(x * weights, dim=1)  # [B, Feature_Dim]
+class SerieTypeNN(nn.Module):
+    def __init__(self, stype):
+        super().__init__()
+        self.stype = stype
+        self.slice_pool = AttentionPooling(in_dim=768, hidden_dim=128)
+        self.slice_conved_pool = AttentionPooling(in_dim=768, hidden_dim=128)
+        conv_kernel_size=7
+        self.conv=nn.Sequential(
+            nn.Conv2d(1, 1, conv_kernel_size,padding=conv_kernel_size // 2),
+            nn.BatchNorm2d(1),
+            nn.GELU(),
+            nn.Dropout(0.2),
+        )
+    def forward(self, feat_flat: torch.Tensor, mask: torch.Tensor, serie_type: torch.Tensor,) -> torch.Tensor:
 
+        mask_mask=((serie_type[:,0]==1) & (serie_type[:,1]==1)).unsqueeze(-1).repeat(1,mask.shape[-1])
+        if self.stype == 0:
+            mask_mask=~mask_mask
+        s_mask_flat = mask & mask_mask
+        series_features = self.slice_pool(feat_flat, mask=s_mask_flat)
+        series_conved=self.conv(feat_flat.unsqueeze(1)).squeeze(1)
+
+        if series_conved.shape[1] != s_mask_flat.shape[1]:
+            pass
+        series_conved_features=self.slice_conved_pool(series_conved, mask=s_mask_flat)
+        return torch.cat((series_features,series_conved_features),dim=1)
 
 class KneeAbnormalityModelRefactored(nn.Module):
 
@@ -479,22 +504,14 @@ class KneeAbnormalityModelRefactored(nn.Module):
         )  # front, back, anterior, medial, lateral, whole
         self.fluid_embed = nn.Embedding(2, 4)
         self.fat_embed = nn.Embedding(2, 4)
-        meta_dim = 8 + 8 + 4 + 4  # Total: 24
+        self.type_embed=nn.Embedding(7, 8)
+        meta_dim = 8 + 8 + 4 + 4 + 8  # Total: 24
         self.inputdropout=nn.Dropout(0.2)
         # 2. Backbone Feature Projection & Attention Pools
-        self.feature_proj = nn.Sequential(nn.Linear(768*2 + meta_dim, 512),nn.ReLU(),nn.Dropout(0.2),nn.Linear(512,256))
-
+        num_types=2
+        self.feature_proj = nn.Sequential(nn.Linear(768*2*num_types + meta_dim, 512),nn.ReLU(),nn.Dropout(0.2),nn.Linear(512,256))
         # Slice-level pooling per series
-        self.slice_pool = AttentionPooling(in_dim=768, hidden_dim=128)
-        self.slice_conved_pool = AttentionPooling(in_dim=768, hidden_dim=128)
-
-        conv_kernel_size=7
-        self.acl_conv=nn.Sequential(
-            nn.Conv1d(768, 768, conv_kernel_size,padding=conv_kernel_size // 2),
-            nn.BatchNorm1d(768),
-            nn.GELU(),
-            nn.Dropout(0.2),
-        )
+        self.serie_proj = nn.ModuleList([SerieTypeNN(i) for i in range(num_types)])
         # Pathology-Specific Series Aggregators
         self.acl_pool = AttentionPooling(in_dim=256, hidden_dim=64)
         self.mcl_pool = AttentionPooling(in_dim=256, hidden_dim=64)
@@ -508,7 +525,7 @@ class KneeAbnormalityModelRefactored(nn.Module):
         self.baker_pool = AttentionPooling(in_dim=256, hidden_dim=64)
         self.contusion_pool = AttentionPooling(in_dim=256, hidden_dim=64)
         self.fracture_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        # self.global_pool = AttentionPooling(in_dim=256, hidden_dim=128)
+        self.global_pool = AttentionPooling(in_dim=256, hidden_dim=128)
 
         # Classification Heads
         self.head_acl = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
@@ -523,7 +540,7 @@ class KneeAbnormalityModelRefactored(nn.Module):
         self.head_baker = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
         self.head_contusion = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
         self.head_fracture = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        # self.head_general = nn.Linear(256, num_labels - 4)
+        self.head_general = nn.Linear(256, num_labels)
 
     def forward(
         self,
@@ -534,6 +551,7 @@ class KneeAbnormalityModelRefactored(nn.Module):
         fluid_sensitive,
         fat_suppression,
         plane_crop_mixed,
+        serie_type
     ):
         """features: [B, Serie, Slices, 768]
 
@@ -545,25 +563,18 @@ class KneeAbnormalityModelRefactored(nn.Module):
         # 1. Pool Slices per Series using Attention -> [B * Serie, 768]
         feat_flat = self.inputdropout(features.view(B * Serie, S, C))
         s_mask_flat = slice_mask.view(B * Serie, S)
-        series_features = self.slice_pool(feat_flat, mask=s_mask_flat).view(
-            B, Serie, C
-        )
-        series_conved=self.acl_conv(feat_flat.transpose(1, 2)).transpose(1, 2)
-        if series_conved.shape[1] != s_mask_flat.shape[1]:
-            pass
-        series_conved_features=self.slice_conved_pool(series_conved, mask=s_mask_flat).view(
-            B, Serie, C
-        )
+        series_features=[x(feat_flat,s_mask_flat,torch.cat([fluid_sensitive.unsqueeze(-1),fat_suppression.unsqueeze(-1)],dim=-1).view(B*Serie,2)).view(B , Serie, C*2) for x in self.serie_proj]
         # 2. Embed Metadata Properly
         p_emb = self.plane_embed(plane_ids.clamp(0, 3))
         c_emb = self.crop_embed(plane_crop_mixed[:, :, 1].clamp(0, 6))
         fl_emb = self.fluid_embed(fluid_sensitive.long().clamp(0, 1))
         ft_emb = self.fat_embed(fat_suppression.long().clamp(0, 1))
-
-        meta_feats = torch.cat([p_emb, c_emb, fl_emb, ft_emb], dim=-1)
+        tp_emb = self.type_embed(serie_type.long().clamp(0,6))
+        series_features_combined = torch.cat(series_features,dim=-1)
+        meta_feats = torch.cat([p_emb, c_emb, fl_emb, ft_emb, tp_emb], dim=-1)
 
         # 3. Concatenate Features + Metadata & Project -> [B, Serie, 256]
-        combined = torch.cat([series_features,series_conved_features, meta_feats], dim=-1)
+        combined = torch.cat([series_features_combined,meta_feats], dim=-1)
         series_embeddings = F.relu(self.feature_proj(combined))
         acl_mask = (
             ((plane_crop_mixed[:, :, 1] == 0) | (plane_crop_mixed[:, :, 1] == 1))
@@ -581,13 +592,13 @@ class KneeAbnormalityModelRefactored(nn.Module):
 
         mm_mask = (
                 ((plane_ids==1) | (plane_ids==2)) &
-                ((plane_crop_mixed[:, :, 1] == 2))
+                ((plane_crop_mixed[:, :, 1] == 0) | (plane_crop_mixed[:, :, 1] == 2))
         )
         mm_series_mask = serie_mask & mm_mask
         mm_feat = self.mm_pool(series_embeddings, mask=mm_series_mask)
         lm_mask = (
                 ((plane_ids==1) | (plane_ids==2)) &
-                ((plane_crop_mixed[:, :, 1] == 3))
+                ((plane_crop_mixed[:, :, 1] == 0) | (plane_crop_mixed[:, :, 1] == 3))
         )
         lm_series_mask = serie_mask & lm_mask
         lm_feat = self.lm_pool(series_embeddings, mask=lm_series_mask)
@@ -605,7 +616,7 @@ class KneeAbnormalityModelRefactored(nn.Module):
         loa_feat = self.loa_pool(series_embeddings, mask=loa_series_mask)
         pfoa_mask = (
                 ((plane_ids==0) | (plane_ids==1)) &
-                ((plane_crop_mixed[:, :, 1] == 5) | (plane_crop_mixed[:, :, 1] == 1))
+                ((plane_crop_mixed[:, :, 1] == 0) | (plane_crop_mixed[:, :, 1] == 5) | (plane_crop_mixed[:, :, 1] == 1))
         )
         pfoa_series_mask = serie_mask & pfoa_mask
         pfoa_feat = self.pfoa_pool(series_embeddings, mask=pfoa_series_mask)
@@ -617,7 +628,7 @@ class KneeAbnormalityModelRefactored(nn.Module):
         effusion_feat = self.effusion_pool(series_embeddings, mask=effusion_series_mask)
         synovitis_mask = (
                 ((plane_ids==0) | (plane_ids==1)) &
-                ((plane_crop_mixed[:, :, 1] == 5) | (plane_crop_mixed[:, :, 1] == 1))
+                ((plane_crop_mixed[:, :, 1] == 0) | (plane_crop_mixed[:, :, 1] == 5) | (plane_crop_mixed[:, :, 1] == 1))
         )
         synovitis_series_mask = serie_mask & synovitis_mask
         synovitis_feat = self.synovitis_pool(series_embeddings, mask=synovitis_series_mask)
@@ -628,7 +639,7 @@ class KneeAbnormalityModelRefactored(nn.Module):
         baker_series_mask = serie_mask & baker_mask
         baker_feat = self.baker_pool(series_embeddings, mask=baker_series_mask)
         contusion_mask = (
-            ((plane_crop_mixed[:, :, 1] == 2) | (plane_crop_mixed[:, :, 1] == 3) | (plane_crop_mixed[:, :, 1] == 1))
+            ((plane_crop_mixed[:, :, 1] == 0) | (plane_crop_mixed[:, :, 1] == 2) | (plane_crop_mixed[:, :, 1] == 3) | (plane_crop_mixed[:, :, 1] == 1))
         )
         contusion_series_mask = serie_mask & contusion_mask
         contusion_feat = self.contusion_pool(series_embeddings, mask=contusion_series_mask)
@@ -637,7 +648,8 @@ class KneeAbnormalityModelRefactored(nn.Module):
         )
         fracture_series_mask = serie_mask & fracture_mask
         fracture_feat = self.fracture_pool(series_embeddings, mask=fracture_series_mask)
-        # gen_feat = self.global_pool(series_embeddings, mask=serie_mask)
+
+        gen_feat = self.global_pool(series_embeddings, mask=serie_mask)
 
         # 5. Output Predictions
         out_acl = self.head_acl(acl_feat)
@@ -652,11 +664,14 @@ class KneeAbnormalityModelRefactored(nn.Module):
         out_baker = self.head_baker(baker_feat)
         out_contusion = self.head_contusion(contusion_feat)
         out_fracture = self.head_fracture(fracture_feat)
-        # out_gen = self.head_general(gen_feat)
-
-        return torch.cat(
-            [out_acl, out_mcl, out_mm, out_lm, out_moa, out_loa, out_pfoa, out_effusion, out_synovitis, out_baker, out_contusion, out_fracture], dim=-1
+        out_gen = self.head_general(gen_feat)
+        prediction_cat=torch.cat(
+            [out_acl, out_mcl, out_mm, out_lm, out_moa, out_loa, out_pfoa, out_effusion, out_synovitis, out_baker,
+             out_contusion, out_fracture], dim=-1
         )
+        wgen_cat=torch.cat([out_gen.unsqueeze(2), prediction_cat.unsqueeze(2)], dim=-1)
+        output=wgen_cat.amin(dim=-1)
+        return output
 if __name__ == '__main__':
     DinoBackbone(str(pathlib.Path.home()/".cache/huggingface/hub/models--microsoft--rad-dino/snapshots/110cbc18d5133582e320b43d53bf5c44e410c936/backbone_compatible.safetensors"))
     pass
