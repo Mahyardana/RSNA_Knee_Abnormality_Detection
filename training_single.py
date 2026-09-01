@@ -38,7 +38,7 @@ try:
 except RuntimeError:
     pass
 print(torch.__version__)
-from model_dino_new1 import KneeAbnormalityModelRefactored
+from model_dino_simplified import KneeAbnormalityModelRefactored
 
 torch.set_float32_matmul_precision('high')
 warnings.filterwarnings('ignore')
@@ -58,7 +58,7 @@ class Config:
     LOAD_PATH = PYTHON_DIR / f"best_model_dino_label.pth"
 
     # ── Image processing ──────────────────────────────────────────────
-    MAX_SLICES_PER_SERIES = 32
+    MAX_SLICES_PER_SERIES = -1
     MAX_SERIES_PER_STUDY = 16
     LABELS = ['ACL', 'MCL', 'Medial Meniscus', 'Lateral Meniscus',
               'Medial OA', 'Lateral OA', 'PF OA', 'Effusion',
@@ -87,7 +87,7 @@ class Config:
     LR = 1e-3
     MIN_LR = 1e-5
     WEIGHT_DECAY = 0.01
-    USE_AMP = False
+    USE_AMP = True
 
     DEBUG_SUBSET = None  # Set to e.g. 100 for fast debugging
     SEED = 42
@@ -1775,8 +1775,8 @@ def main():
         print(f'\n--- Epoch {epoch + 1}/{cfg.EPOCHS} ---')
         without_save_epochs+=1
         train_loss = train_epoch(model, ld_train, optimizer, criterion, scaler, cfg)
-        train_loss2 = train_epoch(model, ld_val2, optimizer, criterion, scaler, cfg)
-        train_loss=(train_loss+train_loss2)/2
+        # train_loss2 = train_epoch(model, ld_val2, optimizer, criterion, scaler, cfg)
+        # train_loss=(train_loss+train_loss2)/2
         val_loss, val_auc = eval_epoch(model, ld_val, criterion, cfg)
         val_loss2, val_auc2 = eval_epoch(model, ld_val2, criterion, cfg)
         current_lr = optimizer.param_groups[0]["lr"]
@@ -1793,18 +1793,19 @@ def main():
         writer.add_scalar("AUC/Average", avgauc, epoch)
 
         writer.add_scalar("Params/Learning_Rate", current_lr, epoch)
-        if val_loss < best_loss:
+        if val_loss2 < best_loss:
             without_save_epochs = 0
-            best_loss = val_loss
+            best_loss = val_loss2
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'val_auc': float(val_auc),
                 'val_auc2': float(val_auc2),
-                'val_loss': float(val_loss)
+                'val_loss': float(val_loss),
+                'val_loss2': float(val_loss2)
 
             }, cfg.SAVE_PATH)
-            print(f'✓ Checkpoint saved (LOSS: {val_loss:.4f})')
+            print(f'✓ Checkpoint saved (LOSS: {val_loss2:.4f})')
         if without_save_epochs >= patience:
             break
         # if val_auc2 > best_auc2:
@@ -1861,7 +1862,7 @@ def refine_labels():
         preds = torch.sigmoid(logits).cpu().numpy()
         labels=labels.cpu().numpy()
         for x,y,study in zip(preds,labels,studies):
-            if abs(y-x)>0.8:
+            if (x>0.9 or x<0.1) and abs(y-x)>0.5:
                 goldupdates[study]=x
         pass
     for study,score in goldupdates.items():
@@ -1889,9 +1890,10 @@ def refine_labels():
         preds = torch.sigmoid(logits).cpu().numpy()
         labels=labels.cpu().numpy()
         for x,y,study in zip(preds,labels,studies):
-            if abs(y-x)>0.8 or (y<0.90 and y>0.20):
+            if (x>0.9 or x<0.1) and abs(y-x)>0.5:
                 updates[study]=x
         pass
+    print(f"Refined Labels: {len(updates)}")
     df_train[cfg.LABELS[cfg.TRAINING_LABEL]] = df_train["StudyInstanceUID"].map(updates).fillna(df_train[cfg.LABELS[cfg.TRAINING_LABEL]])
     df_train.to_csv(cfg.PYTHON_DIR / "refined_llm_labels00000.csv", index=False)
 

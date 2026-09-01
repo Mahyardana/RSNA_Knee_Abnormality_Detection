@@ -459,7 +459,7 @@ class AttentionPooling(nn.Module):
         scores = self.attn(x).squeeze(-1)  # [B, N]
 
         if mask is not None:
-            scores = scores.masked_fill(~mask, -1e8)
+            scores = scores.masked_fill(~mask, -1e4)
 
         weights = F.softmax(scores, dim=-1).unsqueeze(-1)  # [B, N, 1]
         return torch.sum(x * weights, dim=1)  # [B, Feature_Dim]
@@ -471,19 +471,19 @@ class SerieTypeNN(nn.Module):
         self.slice_conved_pool = AttentionPooling(in_dim=768, hidden_dim=128)
         conv_kernel_size=7
         self.conv=nn.Sequential(
-            nn.Conv2d(1, 1, conv_kernel_size,padding=conv_kernel_size // 2),
-            nn.BatchNorm2d(1),
+            nn.Conv1d(768, 768, conv_kernel_size,padding=conv_kernel_size // 2),
+            nn.BatchNorm1d(768),
             nn.GELU(),
             nn.Dropout(0.2),
         )
     def forward(self, feat_flat: torch.Tensor, mask: torch.Tensor, serie_type: torch.Tensor,) -> torch.Tensor:
 
-        mask_mask=((serie_type[:,0]==1) & (serie_type[:,1]==1)).unsqueeze(-1).repeat(1,mask.shape[-1])
-        if self.stype == 0:
-            mask_mask=~mask_mask
-        s_mask_flat = mask & mask_mask
+        # mask_mask=((serie_type[:,0]==1) & (serie_type[:,1]==1)).unsqueeze(-1).repeat(1,mask.shape[-1])
+        # if self.stype == 0:
+        #     mask_mask=~mask_mask
+        s_mask_flat = mask #& mask_mask
         series_features = self.slice_pool(feat_flat, mask=s_mask_flat)
-        series_conved=self.conv(feat_flat.unsqueeze(1)).squeeze(1)
+        series_conved=self.conv(feat_flat.transpose(1, 2)).transpose(1, 2)
 
         if series_conved.shape[1] != s_mask_flat.shape[1]:
             pass
@@ -505,10 +505,10 @@ class KneeAbnormalityModelRefactored(nn.Module):
         self.fluid_embed = nn.Embedding(2, 4)
         self.fat_embed = nn.Embedding(2, 4)
         self.type_embed=nn.Embedding(7, 8)
-        meta_dim = 8 + 8 + 4 + 4 + 8  # Total: 24
+        meta_dim = 8 + 8 + 4 + 4  # Total: 24
         self.inputdropout=nn.Dropout(0.2)
         # 2. Backbone Feature Projection & Attention Pools
-        num_types=2
+        num_types=1
         self.feature_proj = nn.Sequential(nn.Linear(768*2*num_types + meta_dim, 512),nn.ReLU(),nn.Dropout(0.2),nn.Linear(512,256))
         # Slice-level pooling per series
         self.serie_proj = nn.ModuleList([SerieTypeNN(i) for i in range(num_types)])
@@ -525,7 +525,7 @@ class KneeAbnormalityModelRefactored(nn.Module):
         self.baker_pool = AttentionPooling(in_dim=256, hidden_dim=64)
         self.contusion_pool = AttentionPooling(in_dim=256, hidden_dim=64)
         self.fracture_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.global_pool = AttentionPooling(in_dim=256, hidden_dim=128)
+        self.global_pool = AttentionPooling(in_dim=256, hidden_dim=64)
 
         # Classification Heads
         self.head_acl = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
@@ -569,9 +569,9 @@ class KneeAbnormalityModelRefactored(nn.Module):
         c_emb = self.crop_embed(plane_crop_mixed[:, :, 1].clamp(0, 6))
         fl_emb = self.fluid_embed(fluid_sensitive.long().clamp(0, 1))
         ft_emb = self.fat_embed(fat_suppression.long().clamp(0, 1))
-        tp_emb = self.type_embed(serie_type.long().clamp(0,6))
+        # tp_emb = self.type_embed(serie_type.long().clamp(0,6))
         series_features_combined = torch.cat(series_features,dim=-1)
-        meta_feats = torch.cat([p_emb, c_emb, fl_emb, ft_emb, tp_emb], dim=-1)
+        meta_feats = torch.cat([p_emb, c_emb, fl_emb, ft_emb], dim=-1)
 
         # 3. Concatenate Features + Metadata & Project -> [B, Serie, 256]
         combined = torch.cat([series_features_combined,meta_feats], dim=-1)
