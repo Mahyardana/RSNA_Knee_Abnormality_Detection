@@ -118,6 +118,16 @@ def test_jpeg_yolo(model, image_path: str, conf_thresh: float = 0.3):
         .float()
         .unsqueeze(0)
     )
+    orig_hpad=0
+    orig_wpad=0
+    if input_tensor.shape[-2]!=input_tensor.shape[-1]:
+        orig_hpad=input_tensor.shape[-1]- input_tensor.shape[-2] if input_tensor.shape[-1]>input_tensor.shape[-2] else 0
+        orig_wpad=input_tensor.shape[-2]- input_tensor.shape[-1] if input_tensor.shape[-2]>input_tensor.shape[-1] else 0
+        input_tensor = F.pad(
+            input_tensor,
+            (0, orig_wpad, 0, orig_hpad),
+            mode="constant",
+            value=0)
     input_tensor = F.interpolate(
         input_tensor,
         (512, 512),
@@ -143,8 +153,8 @@ def test_jpeg_yolo(model, image_path: str, conf_thresh: float = 0.3):
         cls_id = int(cls_id)
 
         # Scale coordinates back to original image shape
-        px1, py1 = int(x1 * w / 512), int(y1 * h / 512)
-        px2, py2 = int(x2 * w / 512), int(y2 * h / 512)
+        px1, py1 = int(x1 * (w+orig_wpad) / 512), int(y1 * (h+orig_hpad) / 512)
+        px2, py2 = int(x2 * (w+orig_wpad) / 512), int(y2 * (h+orig_hpad) / 512)
 
         label = f"{CLASS_MAP.get(cls_id, 'Unknown')}: {conf:.2f}"
 
@@ -166,5 +176,5 @@ def test_jpeg_yolo(model, image_path: str, conf_thresh: float = 0.3):
 if __name__ == "__main__":
     # model = YOLO("yolo_axial.pt")
     # model.export(format="torchscript",imgsz=(640, 640))
-    model=torch.jit.load("yolo_coronal.torchscript")
-    test_jpeg_yolo(model,"coronaltest.jpg")
+    model=torch.jit.load("yolo_axial.torchscript")
+    test_jpeg_yolo(model,"axial2test.jpg")
