@@ -467,12 +467,12 @@ class SerieTypeNN(nn.Module):
     def __init__(self, stype):
         super().__init__()
         self.stype = stype
-        self.slice_pool = AttentionPooling(in_dim=768, hidden_dim=128)
-        self.slice_conved_pool = AttentionPooling(in_dim=768, hidden_dim=128)
+        self.slice_pool = AttentionPooling(in_dim=1024, hidden_dim=128)
+        self.slice_conved_pool = AttentionPooling(in_dim=1024, hidden_dim=128)
         conv_kernel_size=7
         self.conv=nn.Sequential(
-            nn.Conv1d(768, 768, conv_kernel_size,padding=conv_kernel_size // 2),
-            nn.BatchNorm1d(768),
+            nn.Conv1d(1024, 1024, conv_kernel_size,padding=conv_kernel_size // 2),
+            nn.BatchNorm1d(1024),
             nn.GELU(),
             nn.Dropout(0.2),
         )
@@ -509,7 +509,7 @@ class KneeAbnormalityModelRefactored(nn.Module):
         self.inputdropout=nn.Dropout(0.2)
         # 2. Backbone Feature Projection & Attention Pools
         num_types=1
-        self.feature_proj = nn.Sequential(nn.Linear(768*2*num_types + meta_dim, 512),nn.ReLU(),nn.Dropout(0.2),nn.Linear(512,256))
+        self.feature_proj = nn.Sequential(nn.Linear(1024*2*num_types + meta_dim, 512),nn.ReLU(),nn.Dropout(0.2),nn.Linear(512,256))
         # Slice-level pooling per series
         self.serie_proj = nn.ModuleList([SerieTypeNN(i) for i in range(num_types)])
         # Pathology-Specific Series Aggregators
