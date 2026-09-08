@@ -92,7 +92,8 @@ class Config:
     SEED = 32
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    LABEL_CLAMP_THRESHOLD = 0.8
+    LABEL_CLAMP_THRESHOLD_UPPER = 0.9
+    LABEL_CLAMP_THRESHOLD_LOWER = 0.14
     LABEL_SMOOTHENING_THRESHOLD = 0.1
 
 
@@ -342,13 +343,15 @@ class TorchScriptROIExtractor:
             conf_thresh if highest_conf >= conf_thresh else highest_conf
         )
         decodedyolo = self.decode_yolo_output(predictions, conf_thresh)
-        offsettensor=torch.tensor([orig_w+orig_wpad,orig_h+orig_hpad,orig_w+orig_wpad,orig_h+orig_hpad],device=decodedyolo.device)
+        scale_w = (orig_w + orig_wpad) / 640.0
+        scale_h = (orig_h + orig_hpad) / 640.0
+        scale_tensor = torch.tensor([scale_w, scale_h, scale_w, scale_h], device=decodedyolo.device)
         for pred in decodedyolo:
             if pred[4].item() >= effective_thresh:
                 class_id = int(pred[5].item())
                 category_key = class_map.get(class_id, class_id)
 
-                best_crops[category_key] = (pred[:4]*offsettensor) / 512
+                best_crops[category_key] = (pred[:4]*scale_tensor)
         del best_slice_tensor, predictions
         return best_crops
 
@@ -1159,33 +1162,33 @@ def extract_image_features(batch,visionmodel,roiextractor,caching=True):
                         new_fats.append(all_fats[idx])
                         new_stype.append(all_stype[idx])
                         del tovit
-
+            all_plane_ids = new_plane_ids
+            all_fluids = new_fluids
+            all_fats = new_fats
+            all_stype = new_stype
+            seriesizes=[]
+            for x in range(len(slices_feats)):
+                seriesizes.append(slices_feats[x].shape[0])
+            CHUNK_SIZE = 128  # Process max 32 images at a time through Dino
+            tovit = torch.cat(slices_feats,dim=0).to(cfg.DEVICE)
+            dino_tokens = []
+            with torch.no_grad():
+                for i in range(0, tovit.size(0), CHUNK_SIZE):
+                    chunk = tovit[i: i + CHUNK_SIZE]
+                    if cfg.USE_AMP:
+                        with torch.amp.autocast("cuda", dtype=torch.float16):
+                            chunk_out = visionmodel(chunk)
+                    else:
+                        chunk_out = visionmodel(chunk)
+                    dino_tokens.append(chunk_out)
+            dino_out = torch.cat(dino_tokens, dim=0).cpu()
+            slices_feats=list(torch.split(dino_out, seriesizes, dim=0))
+            del tovit
             if caching:
                 featurecache[study_id] = slices_feats, new_plane_crop_mixed, new_plane_ids, new_fluids, new_fats, new_stype
         else:
             slices_feats, new_plane_crop_mixed, new_plane_ids, new_fluids, new_fats, new_stype = featurecache[study_id]
-        all_plane_ids = new_plane_ids
-        all_fluids = new_fluids
-        all_fats = new_fats
-        all_stype = new_stype
-        seriesizes=[]
-        for x in range(len(slices_feats)):
-            seriesizes.append(slices_feats[x].shape[0])
-        CHUNK_SIZE = 128  # Process max 32 images at a time through Dino
-        tovit = torch.cat(slices_feats,dim=0).to(cfg.DEVICE)
-        dino_tokens = []
-        with torch.no_grad():
-            for i in range(0, tovit.size(0), CHUNK_SIZE):
-                chunk = tovit[i: i + CHUNK_SIZE]
-                if cfg.USE_AMP:
-                    with torch.amp.autocast("cuda", dtype=torch.float16):
-                        chunk_out = visionmodel(chunk)
-                else:
-                    chunk_out = visionmodel(chunk)
-                dino_tokens.append(chunk_out)
-        dino_out = torch.cat(dino_tokens, dim=0).cpu()
-        slices_feats=list(torch.split(dino_out, seriesizes, dim=0))
-        del tovit
+
         if len(all_slices) == 0:
             # Fallback if no images found
             all_slices.append(torch.zeros(3, 224, 224))
@@ -1219,10 +1222,10 @@ def extract_image_features(batch,visionmodel,roiextractor,caching=True):
         studies.append(study_id)
         slices.append(incpufeats)
         slicemasks.append(torch.stack(masks))
-        plane_ids.append(torch.tensor(all_plane_ids, dtype=torch.long),)
-        fats.append(torch.tensor(all_fats, dtype=torch.long))
-        fluids.append(torch.tensor(all_fluids, dtype=torch.long))
-        stype.append(torch.tensor(all_stype, dtype=torch.long))
+        plane_ids.append(torch.tensor(new_plane_ids, dtype=torch.long),)
+        fats.append(torch.tensor(new_fats, dtype=torch.long))
+        fluids.append(torch.tensor(new_fluids, dtype=torch.long))
+        stype.append(torch.tensor(new_stype, dtype=torch.long))
         plane_crop_mixed.append(torch.tensor(new_plane_crop_mixed, dtype=torch.long))
 
     maxslicesize = max([slice.shape[1] for slice in slices])
@@ -1302,9 +1305,10 @@ def train_epoch(model, loader, visionmodel, roiextractor, optimizer, criterion, 
         # fluid_sensitive = batch['fluid_sensitive'].to(cfg.DEVICE)
         # fat_suppression = batch['fat_suppression'].to(cfg.DEVICE)
         labels = batch["labels"].to(cfg.DEVICE)
-        labelsmasks=(labels >= cfg.LABEL_CLAMP_THRESHOLD)
-        labels[labelsmasks] = 1.0
-        labels[~labelsmasks] = 0.0
+        labels[labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER] = 1.0
+        labels[labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER] = 0.0
+        # labelsmasks=(labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER) | (labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER)
+        # labels[~labelsmasks] = 0.5
         slices = batch["slices"].to(cfg.DEVICE)
         slicemasks = batch["slicemasks"].to(cfg.DEVICE)
         fats = batch["fat_suppression"].to(cfg.DEVICE)
@@ -1371,9 +1375,10 @@ def eval_epoch(model, loader, visionmodel, roiextractor, criterion, cfg, iscache
 
         # Target label shape: (B,)
         labels = batch["labels"].to(cfg.DEVICE)
-        labelsmasks=(labels >= cfg.LABEL_CLAMP_THRESHOLD)
-        labels[labelsmasks] = 1.0
-        labels[~labelsmasks] = 0.0
+        labels[labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER] = 1.0
+        labels[labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER] = 0.0
+        # labelsmasks=(labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER) | (labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER)
+        # labels[~labelsmasks] = 0.5
         slices = batch["slices"].to(cfg.DEVICE)
         slicemasks = batch["slicemasks"].to(cfg.DEVICE)
         fats = batch["fat_suppression"].to(cfg.DEVICE)
@@ -1411,7 +1416,7 @@ def eval_epoch(model, loader, visionmodel, roiextractor, criterion, cfg, iscache
     all_labels = np.concatenate(all_labels)
     # all_preds[all_preds >= 0.50]=1.0
     # all_preds[all_preds < 0.50]=0.0
-    binary_labels = (all_labels >= cfg.LABEL_CLAMP_THRESHOLD).astype(int)
+    binary_labels = (all_labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER).astype(int)
     val_loss = np.mean(losses)
     try:
         val_auc = roc_auc_score(binary_labels, all_preds)
