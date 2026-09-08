@@ -21,3 +21,6 @@
 /*.pth
 /slicesfeats
 /runs
+/finetuned/*
+/*.csv
+/*.jpg
