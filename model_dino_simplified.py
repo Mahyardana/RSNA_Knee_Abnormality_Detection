@@ -70,6 +70,23 @@ class SerieTypeNN(nn.Module):
         series_conved_features=self.slice_conved_pool(series_conved, mask=s_mask_flat)
         return torch.cat((series_features,series_conved_features),dim=1)
 
+
+class PerLabelFusion(nn.Module):
+    def __init__(self, num_labels=12, num_branches=3):
+        super().__init__()
+        # Learnable weight matrix of shape (12, 3)
+        self.weights = nn.Parameter(torch.ones(num_labels, num_branches))
+        self.bias = nn.Parameter(torch.zeros(num_labels))
+
+    def forward(self, x):
+        # x shape: (B, 12, 3)
+        # Softmax ensures weights across the 3 branches sum to 1 for each label
+        normalized_weights = F.softmax(self.weights, dim=-1)  # Shape: (12, 3)
+
+        # Weighted sum across the last dimension
+        out = torch.sum(x * normalized_weights, dim=-1) + self.bias  # Shape: (B, 12)
+        return out
+
 class KneeAbnormalityModelRefactored(nn.Module):
 
     def __init__(self, cfg):
@@ -106,6 +123,7 @@ class KneeAbnormalityModelRefactored(nn.Module):
         self.contusion_pool = AttentionPooling(in_dim=256, hidden_dim=64)
         self.fracture_pool = AttentionPooling(in_dim=256, hidden_dim=64)
         self.global_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.output_pool = AttentionPooling(in_dim=256, hidden_dim=64)
 
         # Classification Heads
         self.head_acl = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
@@ -121,6 +139,8 @@ class KneeAbnormalityModelRefactored(nn.Module):
         self.head_contusion = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
         self.head_fracture = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
         self.head_general = nn.Linear(256, num_labels)
+        self.head_pool =nn.Linear(256, num_labels)
+        self.fusion=PerLabelFusion(num_labels,num_branches=3)
 
     def forward(
         self,
@@ -245,13 +265,16 @@ class KneeAbnormalityModelRefactored(nn.Module):
         out_contusion = self.head_contusion(contusion_feat)
         out_fracture = self.head_fracture(fracture_feat)
         out_gen = self.head_general(gen_feat)
+        outputpoolcat=torch.cat(
+            [acl_feat.unsqueeze(1), mcl_feat.unsqueeze(1), mm_feat.unsqueeze(1), lm_feat.unsqueeze(1), moa_feat.unsqueeze(1), loa_feat.unsqueeze(1), pfoa_feat.unsqueeze(1), effusion_feat.unsqueeze(1), synovitis_feat.unsqueeze(1), baker_feat.unsqueeze(1),
+             contusion_feat.unsqueeze(1), fracture_feat.unsqueeze(1)], dim=-2
+        )
+        outputpool=self.output_pool(outputpoolcat)
+        outputpool=self.head_pool(outputpool)
         prediction_cat=torch.cat(
             [out_acl, out_mcl, out_mm, out_lm, out_moa, out_loa, out_pfoa, out_effusion, out_synovitis, out_baker,
              out_contusion, out_fracture], dim=-1
         )
-        wgen_cat=torch.cat([out_gen.unsqueeze(2), prediction_cat.unsqueeze(2)], dim=-1)
-        output=wgen_cat.amin(dim=-1)
+        wgen_cat=torch.cat([out_gen.unsqueeze(2), prediction_cat.unsqueeze(2), outputpool.unsqueeze(2)], dim=-1)
+        output=self.fusion(wgen_cat)
         return output
-if __name__ == '__main__':
-    DinoBackbone(str(pathlib.Path.home()/".cache/huggingface/hub/models--microsoft--rad-dino/snapshots/110cbc18d5133582e320b43d53bf5c44e410c936/backbone_compatible.safetensors"))
-    pass
