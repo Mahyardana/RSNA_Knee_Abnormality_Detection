@@ -153,8 +153,8 @@ def test_jpeg_yolo(model, image_path: str, conf_thresh: float = 0.3):
         cls_id = int(cls_id)
 
         # Scale coordinates back to original image shape
-        px1, py1 = int(x1 * (w+orig_wpad) / 512), int(y1 * (h+orig_hpad) / 512)
-        px2, py2 = int(x2 * (w+orig_wpad) / 512), int(y2 * (h+orig_hpad) / 512)
+        px1, py1 = int(x1 * (w+orig_wpad) / 640), int(y1 * (h+orig_hpad) / 640)
+        px2, py2 = int(x2 * (w+orig_wpad) / 640), int(y2 * (h+orig_hpad) / 640)
 
         label = f"{CLASS_MAP.get(cls_id, 'Unknown')}: {conf:.2f}"
 
@@ -176,5 +176,5 @@ def test_jpeg_yolo(model, image_path: str, conf_thresh: float = 0.3):
 if __name__ == "__main__":
     # model = YOLO("yolo_axial.pt")
     # model.export(format="torchscript",imgsz=(640, 640))
-    model=torch.jit.load("yolo_axial.torchscript")
-    test_jpeg_yolo(model,"axial2test.jpg")
+    model=torch.jit.load("yolo_sagittal.torchscript")
+    test_jpeg_yolo(model,"sagittaltest.jpg")

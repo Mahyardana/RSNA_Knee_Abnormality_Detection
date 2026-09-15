@@ -58,7 +58,7 @@ class Config:
 
     # ── Image processing ──────────────────────────────────────────────
     MAX_SLICES_PER_SERIES = -1
-    MAX_SERIES_PER_STUDY = 16
+    MAX_SERIES_PER_STUDY = 32
     LABELS = ['ACL', 'MCL', 'Medial Meniscus', 'Lateral Meniscus',
               'Medial OA', 'Lateral OA', 'PF OA', 'Effusion',
               'Synovitis', "Baker's", 'Contusion', 'Fracture']
@@ -78,7 +78,7 @@ class Config:
     VAL_FRACTION = 0.10  # 20% val, 80% train
 
     # ── Training hyperparameters ──────────────────────────────────────
-    BATCH_SIZE = 16
+    BATCH_SIZE = 4
     NUM_WORKERS = 4
     GRAD_ACCUM_STEPS = 1
     WARMUP_EPOCHS = 5
@@ -915,19 +915,24 @@ class KneeStudyTrainDataset(Dataset):
             )
             alldcms = sorted_slices
             if self.cfg.MAX_SLICES_PER_SERIES > 0:
-                skipnum = math.ceil(len(alldcms) / self.cfg.MAX_SLICES_PER_SERIES)
-                startidx=0
-                endidx=len(alldcms)
-                slicethickness=float(alldcms[0].SliceThickness)
-                if slicethickness < 2.0:
-                    skipnum = math.ceil(3.0/slicethickness)
-                if len(alldcms)>self.cfg.MAX_SLICES_PER_SERIES*skipnum:
-                    idxoffset=(len(alldcms)-self.cfg.MAX_SLICES_PER_SERIES*skipnum)//2
-                    startidx=idxoffset
-                    endidx=len(alldcms)-idxoffset
-                for i in range(startidx,endidx):
-                    if (i % skipnum) == 0:
-                        dcm_files.append(alldcms[i])
+                if len(alldcms) > self.cfg.MAX_SLICES_PER_SERIES:
+                    indices = np.round(np.linspace(0, len(alldcms) - 1, num=self.cfg.MAX_SLICES_PER_SERIES)).astype(int)
+                    dcm_files = [alldcms[i] for i in indices]
+                else:
+                    dcm_files = alldcms
+                # skipnum = math.ceil(len(alldcms) / self.cfg.MAX_SLICES_PER_SERIES)
+                # startidx=0
+                # endidx=len(alldcms)
+                # slicethickness=float(alldcms[0].SliceThickness)
+                # if slicethickness < 2.0:
+                #     skipnum = math.ceil(3.0/slicethickness)
+                # if len(alldcms)>self.cfg.MAX_SLICES_PER_SERIES*skipnum:
+                #     idxoffset=(len(alldcms)-self.cfg.MAX_SLICES_PER_SERIES*skipnum)//2
+                #     startidx=idxoffset
+                #     endidx=len(alldcms)-idxoffset
+                # for i in range(startidx,endidx):
+                #     if (i % skipnum) == 0:
+                #         dcm_files.append(alldcms[i])
                         # if i==0:
                         #     dcm_files.append(alldcms[i])
                         #     dcm_files.append(alldcms[i+1])
@@ -1307,8 +1312,8 @@ def train_epoch(model, loader, visionmodel, roiextractor, optimizer, criterion, 
         labels = batch["labels"].to(cfg.DEVICE)
         labels[labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER] = 1.0
         labels[labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER] = 0.0
-        # labelsmasks=(labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER) | (labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER)
-        # labels[~labelsmasks] = 0.5
+        labelsmasks=(labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER) | (labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER)
+        labels[~labelsmasks] = 0.5
         slices = batch["slices"].to(cfg.DEVICE)
         slicemasks = batch["slicemasks"].to(cfg.DEVICE)
         fats = batch["fat_suppression"].to(cfg.DEVICE)
@@ -1375,8 +1380,8 @@ def eval_epoch(model, loader, visionmodel, roiextractor, criterion, cfg, iscache
 
         # Target label shape: (B,)
         labels = batch["labels"].to(cfg.DEVICE)
-        labels[labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER] = 1.0
-        labels[labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER] = 0.0
+        # labels[labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER] = 1.0
+        # labels[labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER] = 0.0
         # labelsmasks=(labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER) | (labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER)
         # labels[~labelsmasks] = 0.5
         slices = batch["slices"].to(cfg.DEVICE)
@@ -1416,7 +1421,7 @@ def eval_epoch(model, loader, visionmodel, roiextractor, criterion, cfg, iscache
     all_labels = np.concatenate(all_labels)
     # all_preds[all_preds >= 0.50]=1.0
     # all_preds[all_preds < 0.50]=0.0
-    binary_labels = (all_labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER).astype(int)
+    binary_labels = (all_labels >= 0.50).astype(int)
     val_loss = np.mean(losses)
     try:
         val_auc = roc_auc_score(binary_labels, all_preds)
@@ -1429,6 +1434,7 @@ def eval_epoch(model, loader, visionmodel, roiextractor, criterion, cfg, iscache
 class AsymmetricLossOptimized(nn.Module):
     """
     Numerically stable Asymmetric Loss for Multi-Label Classification.
+    Masks out ambiguous/missing labels marked with target value 0.5.
     """
 
     def __init__(self, gamma_neg: float = 4.0, gamma_pos: float = 1.0, clip: float = 0.05, eps: float = 1e-5):
@@ -1439,6 +1445,10 @@ class AsymmetricLossOptimized(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # 0. Mask missing/ambiguous labels (y == 0.5) and binarize clean targets
+        valid_mask = (y != 0.5).float()
+        targets = (y > 0.5).float()
+
         # 1. Compute probabilities from raw logits
         x_sigmoid = torch.sigmoid(x)
         xs_pos = x_sigmoid
@@ -1449,23 +1459,27 @@ class AsymmetricLossOptimized(nn.Module):
             xs_neg = (xs_neg + self.clip).clamp(max=1.0)
 
         # 3. Calculate basic log loss components safely
-        loss_pos = y * torch.log(xs_pos.clamp(min=self.eps))
-        loss_neg = (1.0 - y) * torch.log(xs_neg.clamp(min=self.eps))
+        loss_pos = targets * torch.log(xs_pos.clamp(min=self.eps))
+        loss_neg = (1.0 - targets) * torch.log(xs_neg.clamp(min=self.eps))
         loss = loss_pos + loss_neg
 
         # 4. Apply Asymmetric Focusing Weights without backpropagating through the weights
         if self.gamma_neg > 0 or self.gamma_pos > 0:
             with torch.no_grad():
-                pt0 = xs_pos * y
-                pt1 = xs_neg * (1.0 - y)
+                pt0 = xs_pos * targets
+                pt1 = xs_neg * (1.0 - targets)
                 pt = pt0 + pt1
-                one_sided_gamma = self.gamma_pos * y + self.gamma_neg * (1.0 - y)
+                one_sided_gamma = self.gamma_pos * targets + self.gamma_neg * (1.0 - targets)
                 # Clamp (1.0 - pt) to 0.0 to prevent negative bases in pow
                 one_sided_w = torch.pow((1.0 - pt).clamp(min=0.0), one_sided_gamma)
 
             loss = loss * one_sided_w
 
-        return -loss.mean()
+        # 5. Mask out 0.5 labels
+        loss = loss * valid_mask
+
+        # 6. Normalize strictly by the count of active/valid labels in the batch
+        return -loss.sum() / valid_mask.sum().clamp(min=1e-8)
 
 
 def build_optimizer_with_decay_exclusion(model, lr=2e-4, weight_decay=0.01):
@@ -1818,8 +1832,7 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f'Trainable: {trainable_params:,} / Total: {total_params:,}  ({100 * trainable_params / total_params:.1f}%)')
     print('RadDino backbone frozen ✓')
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR,
-                                  weight_decay=cfg.WEIGHT_DECAY)  # build_optimizer_with_decay_exclusion(model, lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)#build_optimizer_with_decay_exclusion(model, lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
     scheduler_cosine = CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=cfg.MIN_LR)
     scheduler_warmup = LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0, total_iters=cfg.WARMUP_EPOCHS
@@ -1832,8 +1845,8 @@ def main():
     visionmodel = timm.create_model("vit_base_patch16_224",
                                  pretrained=False,
                                  num_classes=0,
-                                 dynamic_img_size=False,
-                                 checkpoint_path="radiodino/model.safetensors")
+                                 dynamic_img_size=False)
+    visionmodel.load_state_dict(torch.load("best_model_dino_finetuned.pth")["model_state_dict"])
     visionmodel.eval()
     visionmodel.requires_grad_(False)
     visionmodel.to(cfg.DEVICE)
@@ -1897,8 +1910,8 @@ def main():
     train_dataset, val_dataset = random_split(
         train_cached_ds, [train_size, val_size], generator=generator
     )
-    ld_train = DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=cache_collate_fn, num_workers=cfg.NUM_WORKERS, persistent_workers=True if cfg.NUM_WORKERS>0 else False, pin_memory=True)
-    ld_val2 = DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=cache_collate_fn, num_workers=cfg.NUM_WORKERS, persistent_workers=True if cfg.NUM_WORKERS>0 else False, pin_memory=True)
+    ld_train = DataLoader(train_dataset, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=cache_collate_fn, num_workers=cfg.NUM_WORKERS, persistent_workers=True if cfg.NUM_WORKERS>0 else False, pin_memory=True)
+    ld_val2 = DataLoader(val_dataset, batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=cache_collate_fn, num_workers=cfg.NUM_WORKERS, persistent_workers=True if cfg.NUM_WORKERS>0 else False, pin_memory=True)
     num_positives = 0
     num_negatives = 0
 
@@ -1922,7 +1935,7 @@ def main():
     #
     # print(f"Positives: {num_positives} | Negatives: {num_negatives}")
     # pos_weight = torch.tensor([num_negatives / num_positives]).to(cfg.DEVICE)
-    criterion = AsymmetricLossOptimized(gamma_neg=3.0, gamma_pos=0.0, clip=0.05)  # AsymmetricLossOptimized(gamma_neg=4.0, gamma_pos=1.0, clip=0.05)#WeightedBCELoss(pos_weight=pos_weights)##nn.BCEWithLogitsLoss()
+    criterion = AsymmetricLossOptimized(gamma_neg=4.0, gamma_pos=0.0, clip=0.05)  # AsymmetricLossOptimized(gamma_neg=4.0, gamma_pos=1.0, clip=0.05)#WeightedBCELoss(pos_weight=pos_weights)##nn.BCEWithLogitsLoss()
     best_loss = 100.0
     best_auc = 0
     writer = SummaryWriter(comment=f"ALL")

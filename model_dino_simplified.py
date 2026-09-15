@@ -21,8 +21,6 @@ from torch.nn.utils.rnn import pad_sequence
 
 
 class AttentionPooling(nn.Module):
-    """Attention-based pooling over variable slice/series dimensions."""
-
     def __init__(self, in_dim: int, hidden_dim: int = 128):
         super().__init__()
         self.attn = nn.Sequential(
@@ -32,24 +30,27 @@ class AttentionPooling(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(
-        self, x: torch.Tensor, mask: torch.Tensor = None
-    ) -> torch.Tensor:
-        # x: [B, N, Feature_Dim], mask: [B, N] (True for valid, False for padding)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         scores = self.attn(x).squeeze(-1)  # [B, N]
 
         if mask is not None:
-            scores = scores.masked_fill(~mask, -1e4)
+            # Prevent -inf when an entire row in the batch is False
+            mask_sum = mask.sum(dim=-1, keepdim=True)
+            # If a row has 0 valid elements, unmask everything for that row as a fallback
+            valid_mask = torch.where(mask_sum == 0, torch.ones_like(mask), mask)
+
+            # Use FP16-safe fill value (-1e4 instead of -1e9)
+            scores = scores.masked_fill(~valid_mask, -1e4)
 
         weights = F.softmax(scores, dim=-1).unsqueeze(-1)  # [B, N, 1]
-        return torch.sum(x * weights, dim=1)  # [B, Feature_Dim]
+        return torch.sum(x * weights, dim=1)
 class SerieTypeNN(nn.Module):
     def __init__(self, stype, inputdim=768):
         super().__init__()
         self.stype = stype
         self.slice_pool = AttentionPooling(in_dim=inputdim, hidden_dim=128)
         self.slice_conved_pool = AttentionPooling(in_dim=inputdim, hidden_dim=128)
-        conv_kernel_size=7
+        conv_kernel_size=3
         self.conv=nn.Sequential(
             nn.Conv1d(inputdim, inputdim, conv_kernel_size,padding=conv_kernel_size // 2),
             nn.BatchNorm1d(inputdim),
@@ -58,12 +59,14 @@ class SerieTypeNN(nn.Module):
         )
     def forward(self, feat_flat: torch.Tensor, mask: torch.Tensor, serie_type: torch.Tensor,) -> torch.Tensor:
 
-        # mask_mask=((serie_type[:,0]==1) & (serie_type[:,1]==1)).unsqueeze(-1).repeat(1,mask.shape[-1])
-        # if self.stype == 0:
-        #     mask_mask=~mask_mask
-        s_mask_flat = mask #& mask_mask
+        mask_mask=((serie_type[:,0]==1) & (serie_type[:,1]==1)).unsqueeze(-1).repeat(1,mask.shape[-1])
+        if self.stype == 0:
+            mask_mask=~mask_mask
+        s_mask_flat = mask & mask_mask
         series_features = self.slice_pool(feat_flat, mask=s_mask_flat)
-        series_conved=self.conv(feat_flat.transpose(1, 2)).transpose(1, 2)
+        series_conved = self.conv(feat_flat.transpose(1, 2)).transpose(1, 2)
+        # Zero out padded positions so Conv1D boundary artifacts don't pollute the attention pool
+        series_conved = series_conved * s_mask_flat.unsqueeze(-1).float()
 
         if series_conved.shape[1] != s_mask_flat.shape[1]:
             pass
@@ -89,11 +92,11 @@ class PerLabelFusion(nn.Module):
 
 class KneeAbnormalityModelRefactored(nn.Module):
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, inputdim=768):
         super().__init__()
         self.cfg = cfg
         num_labels = getattr(cfg, "NUM_LABELS", 12)
-        inputdim=768
+        # inputdim=768
         # 1. Categorical Metadata Embeddings (Fixes Linear Scalar Bug)
         self.plane_embed = nn.Embedding(4, 8)  # Sagittal, Axial, Coronal
         self.crop_embed = nn.Embedding(
@@ -105,42 +108,51 @@ class KneeAbnormalityModelRefactored(nn.Module):
         meta_dim = 8 + 8 + 4 + 4  # Total: 24
         self.inputdropout=nn.Dropout(0.2)
         # 2. Backbone Feature Projection & Attention Pools
-        num_types=1
-        self.feature_proj = nn.Sequential(nn.Linear(inputdim*2*num_types + meta_dim, 512),nn.ReLU(),nn.Dropout(0.2),nn.Linear(512,256))
+        num_types=2
+        self.feature_proj = nn.Sequential(
+            nn.Linear(inputdim * 2 * num_types + meta_dim, 768),
+            nn.LayerNorm(768), # Added BN for stability
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(768, 512)
+        )
         # Slice-level pooling per series
         self.serie_proj = nn.ModuleList([SerieTypeNN(i,inputdim) for i in range(num_types)])
         # Pathology-Specific Series Aggregators
-        self.acl_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.mcl_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.mm_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.lm_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.moa_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.loa_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.pfoa_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.effusion_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.synovitis_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.baker_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.contusion_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.fracture_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.global_pool = AttentionPooling(in_dim=256, hidden_dim=64)
-        self.output_pool = AttentionPooling(in_dim=256, hidden_dim=64)
+        self.acl_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.mcl_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.mm_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.lm_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.moa_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.loa_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.pfoa_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.effusion_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.synovitis_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.baker_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.contusion_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.fracture_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.global_pool = AttentionPooling(in_dim=512, hidden_dim=128)
+        self.output_pool = AttentionPooling(in_dim=512, hidden_dim=128)
 
         # Classification Heads
-        self.head_acl = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        self.head_mcl = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        self.head_mm = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        self.head_lm = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        self.head_moa = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        self.head_loa = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        self.head_pfoa = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        self.head_effusion = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        self.head_synovitis = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        self.head_baker = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        self.head_contusion = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        self.head_fracture = nn.Sequential(nn.Dropout(0.2),nn.Linear(256, 1))
-        self.head_general = nn.Linear(256, num_labels)
-        self.head_pool =nn.Linear(256, num_labels)
-        self.fusion=PerLabelFusion(num_labels,num_branches=3)
+        self.head_acl = nn.Sequential(nn.Dropout(0.2),nn.Linear(512, 1))
+        self.head_mcl = nn.Sequential(nn.Dropout(0.2),nn.Linear(512, 1))
+        self.head_mm = nn.Sequential(nn.Dropout(0.2),nn.Linear(512, 1))
+        self.head_lm = nn.Sequential(nn.Dropout(0.2),nn.Linear(512, 1))
+        self.head_moa = nn.Sequential(nn.Dropout(0.2),nn.Linear(512, 1))
+        self.head_loa = nn.Sequential(nn.Dropout(0.2),nn.Linear(512, 1))
+        self.head_pfoa = nn.Sequential(nn.Dropout(0.2),nn.Linear(512, 1))
+        self.head_effusion = nn.Sequential(nn.Dropout(0.2),nn.Linear(512, 1))
+        self.head_synovitis = nn.Sequential(nn.Dropout(0.2),nn.Linear(512, 1))
+        self.head_baker = nn.Sequential(nn.Dropout(0.2),nn.Linear(512, 1))
+        self.head_contusion = nn.Sequential(nn.Dropout(0.2),nn.Linear(512, 1))
+        self.head_fracture = nn.Sequential(nn.Dropout(0.2),nn.Linear(512, 1))
+        self.head_general = nn.Linear(512, num_labels)
+        self.head_pool =nn.Linear(512, num_labels)
+        self.fusion=PerLabelFusion(num_labels,num_branches=2)
+        # Forces every output probability to start at ~0.01 (1%)
+        with torch.no_grad():
+            self.fusion.bias.fill_(-4.59)
 
     def forward(
         self,
@@ -265,16 +277,16 @@ class KneeAbnormalityModelRefactored(nn.Module):
         out_contusion = self.head_contusion(contusion_feat)
         out_fracture = self.head_fracture(fracture_feat)
         out_gen = self.head_general(gen_feat)
-        outputpoolcat=torch.cat(
-            [acl_feat.unsqueeze(1), mcl_feat.unsqueeze(1), mm_feat.unsqueeze(1), lm_feat.unsqueeze(1), moa_feat.unsqueeze(1), loa_feat.unsqueeze(1), pfoa_feat.unsqueeze(1), effusion_feat.unsqueeze(1), synovitis_feat.unsqueeze(1), baker_feat.unsqueeze(1),
-             contusion_feat.unsqueeze(1), fracture_feat.unsqueeze(1)], dim=-2
-        )
-        outputpool=self.output_pool(outputpoolcat)
-        outputpool=self.head_pool(outputpool)
+        # outputpoolcat=torch.cat(
+        #     [acl_feat.unsqueeze(1), mcl_feat.unsqueeze(1), mm_feat.unsqueeze(1), lm_feat.unsqueeze(1), moa_feat.unsqueeze(1), loa_feat.unsqueeze(1), pfoa_feat.unsqueeze(1), effusion_feat.unsqueeze(1), synovitis_feat.unsqueeze(1), baker_feat.unsqueeze(1),
+        #      contusion_feat.unsqueeze(1), fracture_feat.unsqueeze(1)], dim=-2
+        # )
+        # outputpool=self.output_pool(outputpoolcat)
+        # outputpool=self.head_pool(outputpool)
         prediction_cat=torch.cat(
             [out_acl, out_mcl, out_mm, out_lm, out_moa, out_loa, out_pfoa, out_effusion, out_synovitis, out_baker,
              out_contusion, out_fracture], dim=-1
         )
-        wgen_cat=torch.cat([out_gen.unsqueeze(2), prediction_cat.unsqueeze(2), outputpool.unsqueeze(2)], dim=-1)
+        wgen_cat=torch.cat([out_gen.unsqueeze(2), prediction_cat.unsqueeze(2)], dim=-1)
         output=self.fusion(wgen_cat)
         return output
