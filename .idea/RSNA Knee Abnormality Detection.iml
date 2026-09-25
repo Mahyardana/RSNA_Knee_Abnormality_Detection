@@ -5,6 +5,14 @@
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
       <excludeFolder url="file://$MODULE_DIR$/models" />
       <excludeFolder url="file://$MODULE_DIR$/.venv39" />
+      <excludeFolder url="file://$MODULE_DIR$/finetuned" />
+      <excludeFolder url="file://$MODULE_DIR$/runs" />
+      <excludeFolder url="file://$MODULE_DIR$/slicesfeats-s16-finetuned" />
+      <excludeFolder url="file://$MODULE_DIR$/venv-cu12" />
+      <excludeFolder url="file://$MODULE_DIR$/facebookresearch_dinov2_main" />
+      <excludeFolder url="file://$MODULE_DIR$/slicesfeats" />
+      <excludeFolder url="file://$MODULE_DIR$/singlelabelmodels" />
+      <excludeFolder url="file://$MODULE_DIR$/slicesfeats-s16-orig" />
     </content>
     <orderEntry type="jdk" jdkName="$MODULE_DIR$/.venv" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
