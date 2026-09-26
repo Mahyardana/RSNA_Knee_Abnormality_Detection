@@ -104,7 +104,7 @@ class KneeAbnormalityModelRefactored(nn.Module):
         self.fluid_embed = nn.Embedding(2, 4)
         self.fat_embed = nn.Embedding(2, 4)
         meta_dim = 8 + 8 + 4 + 4  # Total: 24
-
+        self.feature_attn=MultiHeadAttentionPooling(in_dim=inputdim)
         self.inputdropout = nn.Dropout(0.2)
         num_types = 2
 
@@ -142,13 +142,14 @@ class KneeAbnormalityModelRefactored(nn.Module):
         plane_crop_mixed,
         serie_type
     ):
-        B, Serie, S, C = features.shape
 
+        B, Serie, S, P, C = features.shape
+        feat_attn=features.view(B * Serie * S, P, C)
+        feat_attn=self.feature_attn(feat_attn)
         # 1. Feature Extraction per Series
-        feat_flat = self.inputdropout(features.reshape(B * Serie, S, C))
+        feat_flat = feat_attn.view(B * Serie, S, C)
         s_mask_flat = slice_mask.view(B * Serie, S)
         type_cond = torch.cat([fluid_sensitive.unsqueeze(-1), fat_suppression.unsqueeze(-1)], dim=-1).view(B * Serie, 2)
-
         series_features = [
             x(feat_flat, s_mask_flat, type_cond).view(B, Serie, C * 2)
             for x in self.serie_proj

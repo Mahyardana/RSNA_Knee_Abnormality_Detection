@@ -81,10 +81,10 @@ class Config:
     VAL_FRACTION = 0.10
 
     # ── Training hyperparameters ──────────────────────────────────────
-    BATCH_SIZE = 1
-    NUM_WORKERS = 4
+    BATCH_SIZE = 16
+    NUM_WORKERS = 0
     PREFETCH_FACTOR = 8
-    GRAD_ACCUM_STEPS = 64
+    GRAD_ACCUM_STEPS = 8
     WARMUP_EPOCHS = 5
     EPOCHS = 100
     LR = 1e-3
@@ -840,7 +840,7 @@ def train_epoch(model, loader, visionmodel, roiextractor, optimizer, criterion, 
         # labels[labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER] = 0.0
         # labelsmasks = (labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER) | (labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER)
         # labels[~labelsmasks] = 0.5
-        slices = batch["slices"].to(cfg.DEVICE)[:,:,:,0:16,:]
+        slices = batch["slices"].to(cfg.DEVICE)
         slicemasks = batch["slicemasks"].to(cfg.DEVICE)
         fats = batch["fat_suppression"].to(cfg.DEVICE)
         fluids = batch["fluid_sensitive"].to(cfg.DEVICE)
@@ -885,7 +885,7 @@ def eval_epoch(model, loader, visionmodel, roiextractor, criterion, cfg, iscache
             batch = batched_features
 
         labels = batch["labels"].to(cfg.DEVICE)
-        slices = batch["slices"].to(cfg.DEVICE)[:,:,:,0:16,:]
+        slices = batch["slices"].to(cfg.DEVICE)
         slicemasks = batch["slicemasks"].to(cfg.DEVICE)
         fats = batch["fat_suppression"].to(cfg.DEVICE)
         fluids = batch["fluid_sensitive"].to(cfg.DEVICE)
@@ -1079,16 +1079,15 @@ def cache_collate_fn(batch):
     B = len(batch)
 
     # Calculate maximum sequence lengths across the batch
-    maxseriesize = max(s[0].shape[0] for s in kfold_slices)
-    maxslicesize = max(s[0].shape[1] for s in kfold_slices)
-
-    first_slice = kfold_slices[0][0]
-    device = first_slice.device
-    num_folds = len(kfold_slices[0])
-    channels = first_slice.shape[-1]
+    maxseriesize = max(s.shape[0] for s in kfold_slices)
+    maxslicesize = max(s.shape[1] for s in kfold_slices)
+    channels=kfold_slices[0].shape[-1]
+    patches=kfold_slices[0].shape[-2]
+    device=kfold_slices[0].device
+    first_slice=kfold_slices[0]
 
     # 1. Pre-allocate target tensors filled with default pad values
-    padded_slices = torch.zeros((B, num_folds, maxseriesize, maxslicesize, channels), dtype=first_slice.dtype,
+    padded_slices = torch.zeros((B, maxseriesize, maxslicesize, patches, channels), dtype=first_slice.dtype,
                                 device=device)
     padded_slicemasks = torch.zeros((B, maxseriesize, maxslicesize), dtype=torch.bool, device=device)
     seriemasks = torch.zeros((B, maxseriesize), dtype=torch.bool, device=device)
@@ -1113,10 +1112,7 @@ def cache_collate_fn(batch):
         padded_plane_crop[i, :s_len] = plane_crop_mixed[i].long()
         seriemasks[i, :s_len] = True
         padded_slicemasks[i, :s_len, :l_len] = slicemasks[i]
-
-        # Copy slices across all folds
-        for k in range(num_folds):
-            padded_slices[i, k, :s_len, :l_len] = kfold_slices[i][k]
+        padded_slices[i, :s_len, :l_len, :] = kfold_slices[i]
 
     return {
         "study_id": list(studies),
@@ -1347,7 +1343,7 @@ def main():
         shuffle=False,
         collate_fn=cache_collate_fn,
         num_workers=cfg.NUM_WORKERS,
-        prefetch_factor=cfg.PREFETCH_FACTOR
+        # prefetch_factor=cfg.PREFETCH_FACTOR
     )
     # ── 2. Setup Multilabel Stratified K-Fold for Main Model ────────────────
     labels_matrix = torch.stack(train_cached_ds.labels).cpu().numpy()
@@ -1377,7 +1373,7 @@ def main():
                 num_workers=cfg.NUM_WORKERS,
                 persistent_workers=True if cfg.NUM_WORKERS > 0 else False,
                 pin_memory=False,
-                prefetch_factor=cfg.PREFETCH_FACTOR
+                # prefetch_factor=cfg.PREFETCH_FACTOR
             )
             ld_val = DataLoader(
                 val_sub,
@@ -1387,7 +1383,7 @@ def main():
                 num_workers=cfg.NUM_WORKERS,
                 persistent_workers=True if cfg.NUM_WORKERS > 0 else False,
                 pin_memory=False,
-                prefetch_factor=cfg.PREFETCH_FACTOR
+                # prefetch_factor=cfg.PREFETCH_FACTOR
             )
 
             print(f"Fold {dinofold}-{fold + 1} - Train samples: {len(train_sub)} | Val samples: {len(val_sub)}")
