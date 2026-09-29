@@ -1427,8 +1427,8 @@ def main():
             #                                 dynamic_img_size=True, checkpoint_path="radiodinos16.safetensors")
             # # visionmodel.load_state_dict(torch.load(f"radiodinov2_ssl_finetuned_backbone.pth")["model_state_dict"])
             # visionmodel=LoadRadImageNet(densenet=False)
-            visionmodel=torchvision.models.resnext50_32x4d(pretrained=False)
-            visionmodel.fc=nn.Identity()
+            visionmodel=timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))
+            # visionmodel.fc=nn.Identity()
             testout=visionmodel(torch.rand(1,3,224,224))
             visionmodel.train()
             visionmodel.requires_grad_(False)
@@ -1461,7 +1461,7 @@ def main():
             print(f"Fold {dinofold}-{fold + 1} - Train samples: {len(train_sub)} | Val samples: {len(val_sub)}")
 
             # Fresh Main Model Instance per Fold
-            model = KneeAbnormalityModelRefactored(cfg,inputdim=2048).to(cfg.DEVICE)
+            model = KneeAbnormalityModelRefactored(cfg,inputdim=768).to(cfg.DEVICE)
             model.train()
             if cfg.LOAD_PATH.exists():
                 model.load_state_dict(torch.load(cfg.LOAD_PATH, weights_only=True)["model_state_dict"], strict=False)
@@ -1583,7 +1583,7 @@ def main():
     # ── Feature Caching for Holdout Gold Validation Set ───────────────────────
     if not (cfg.PYTHON_DIR / "val_feats.pt").exists():
         print("Caching features for Gold Validation set...")
-        dummy_model = KneeAbnormalityModelRefactored(cfg,inputdim=384).to(cfg.DEVICE)
+        dummy_model = KneeAbnormalityModelRefactored(cfg,inputdim=768).to(cfg.DEVICE)
         # visionmodel = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=0,dynamic_img_size=True)
         visionmodel = timm.create_model("vit_small_patch16_224", pretrained=True, num_classes=0,
                                         dynamic_img_size=True, checkpoint_path="radiodinos16.safetensors")
@@ -1655,11 +1655,11 @@ def evaluate_ensemble(
                 continue
 
             print(f"Loading checkpoint [{fold_idx+dinofold + 1}/{len(fold_paths)}]: {path}")
-            model = model_class(cfg,inputdim=2048).to(cfg.DEVICE)
+            model = model_class(cfg,inputdim=768).to(cfg.DEVICE)
             checkpoint = torch.load(path, map_location=cfg.DEVICE)
             model.load_state_dict(checkpoint['model_state_dict'])
-            visionmodel=torchvision.models.resnext50_32x4d(pretrained=False)
-            visionmodel.fc=nn.Identity()
+            visionmodel=timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))#torchvision.models.resnext50_32x4d(pretrained=False)
+            # visionmodel.fc=nn.Identity()
             vcheckpoint = torch.load(vpath, map_location=cfg.DEVICE)
             visionmodel.load_state_dict(vcheckpoint['model_state_dict'])
             testout=visionmodel(torch.rand(1,3,224,224))
