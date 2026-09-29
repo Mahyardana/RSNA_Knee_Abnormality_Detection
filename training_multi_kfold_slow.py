@@ -58,7 +58,7 @@ class Config:
     LOAD_PATH = PYTHON_DIR / f"best_model_dino_label.pth"
 
     # ── Image processing ──────────────────────────────────────────────
-    MAX_SLICES_PER_SERIES = -1
+    MAX_SLICES_PER_SERIES = 8
     MAX_SERIES_PER_STUDY = 32
     LABELS = ['ACL', 'MCL', 'Medial Meniscus', 'Lateral Meniscus',
               'Medial OA', 'Lateral OA', 'PF OA', 'Effusion',
@@ -84,13 +84,15 @@ class Config:
     BATCH_SIZE = 1
     NUM_WORKERS = 4
     PREFETCH_FACTOR = 8
-    GRAD_ACCUM_STEPS = 64
+    GRAD_ACCUM_STEPS = 32
     WARMUP_EPOCHS = 5
     EPOCHS = 100
-    LR = 1e-3
-    MIN_LR = 1e-5
+    LR = 1e-4
+    VLR = 1e-4
+    MIN_LR = 1e-7
+    MIN_VLR = 1e-7
     WEIGHT_DECAY = 0.01
-    USE_AMP = False
+    USE_AMP = True
 
     DEBUG_SUBSET = None  # Set to e.g. 100 for fast debugging
     SEED = 32
@@ -468,20 +470,24 @@ class KneeStudyTrainDataset(Dataset):
             alldcms = sorted_slices
             if self.cfg.MAX_SLICES_PER_SERIES > 0:
                 if len(alldcms) > self.cfg.MAX_SLICES_PER_SERIES:
-                    indices = np.round(np.linspace(0, len(alldcms) - 1, num=self.cfg.MAX_SLICES_PER_SERIES)).astype(int)
+                    indices = np.round(np.linspace(0, len(alldcms) - 1, num=self.cfg.MAX_SLICES_PER_SERIES*3)).astype(int)
                     dcm_files = [alldcms[i] for i in indices]
                 else:
                     dcm_files = alldcms
             else:
                 dcm_files = alldcms
             slices = []
+            packofthrees=[]
             for dcm_file in dcm_files:
                 try:
                     img = self.safe_load_dicom_array(dcm_file.filename)
                     img = (img - img.min()) / (img.max() - img.min() + 1e-8)
                     img = np.clip(img, 0.0, 1.0)
-                    img = np.stack([img, img, img], axis=0)
-                    slices.append(torch.from_numpy(img))
+                    packofthrees.append(torch.from_numpy(img))
+                    if len(packofthrees)==3:
+                        img = np.stack(packofthrees, axis=0)
+                        packofthrees = []
+                        slices.append(torch.from_numpy(img))
                 except Exception:
                     pass
 
@@ -618,7 +624,7 @@ def extract_image_features(batch, visionmodel, roiextractor, caching=True):
 
                 # 2. Whole Image / Full Bounding Box Crop
                 squared_whole = pad_to_square(cropped)
-                resized_whole = F.interpolate(squared_whole, (512, 512), mode='bilinear', align_corners=False)
+                resized_whole = F.interpolate(squared_whole, (224, 224), mode='bilinear', align_corners=False)
                 listofcrops.append((resized_whole - mean) / std)
 
                 # # 3. Calculate 140mm Patch Dimensions in Pixels
@@ -667,7 +673,7 @@ def extract_image_features(batch, visionmodel, roiextractor, caching=True):
                 #         del tovit
                 tovit = crop_and_resize_box(y, torch.tensor([0, 0, y.shape[-1], y.shape[-2]], dtype=torch.float), z,sizemm=cfg.CROP_SIZE_MM)
                 for vitout in tovit:
-                    slices_feats.append(vitout.detach().cpu())
+                    slices_feats.append(vitout)
                     new_plane_crop_mixed.append([all_plane_ids[idx], rev_class_map['whole']])
                     new_plane_ids.append(all_plane_ids[idx])
                     new_fluids.append(all_fluids[idx])
@@ -683,15 +689,14 @@ def extract_image_features(batch, visionmodel, roiextractor, caching=True):
             CHUNK_SIZE = 64
             tovit = torch.cat(slices_feats, dim=0).to(cfg.DEVICE)
             dino_tokens = []
-            with torch.no_grad():
-                for i in range(0, tovit.size(0), CHUNK_SIZE):
-                    chunk = tovit[i: i + CHUNK_SIZE]
-                    if cfg.USE_AMP:
-                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                            chunk_out = visionmodel.forward_features(chunk)
-                    else:
-                        chunk_out = visionmodel.forward_features(chunk)
-                    dino_tokens.append(chunk_out.detach().cpu())
+            for i in range(0, tovit.size(0), CHUNK_SIZE):
+                chunk = tovit[i: i + CHUNK_SIZE]
+                if cfg.USE_AMP:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        chunk_out = visionmodel(chunk)
+                else:
+                    chunk_out = visionmodel(chunk)
+                dino_tokens.append(chunk_out.unsqueeze(1).float())
                     # patches = chunk_out[:, 1:, :]
                     #
                     # # Rearrange to spatial grid: (Batch, Channels, Height, Width)
@@ -826,15 +831,20 @@ def extract_image_features(batch, visionmodel, roiextractor, caching=True):
 # ── Train & Eval Epochs ───────────────────────────────────────────────────────
 def train_epoch(model, loader, visionmodel, roiextractor, optimizer, criterion, scaler, cfg, iscached=True,dinofold=0):
     model.train()
+    visionmodel.train()
     losses = []
     optimizer.zero_grad()
 
     pbar = tqdm(loader, desc='Train', leave=False)
     for batch_idx, batch in enumerate(pbar):
         if not iscached:
-            with torch.no_grad():
+            if cfg.USE_AMP:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    batched_features = extract_image_features(batch, visionmodel, roiextractor, caching=False)
+                    batch = batched_features
+            else:
                 batched_features = extract_image_features(batch, visionmodel, roiextractor, caching=False)
-            batch = batched_features
+                batch = batched_features
 
         labels = batch["labels"].to(cfg.DEVICE)
         # labels[labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER] = 1.0
@@ -856,19 +866,24 @@ def train_epoch(model, loader, visionmodel, roiextractor, optimizer, criterion, 
             if cfg.USE_AMP:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)
+                    loss = criterion(logits.float(), labels.float())
+                    loss = loss / cfg.GRAD_ACCUM_STEPS
             else:
                 logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)
-            loss = criterion(logits, labels)
-            loss = loss / cfg.GRAD_ACCUM_STEPS
+                loss = criterion(logits, labels)
+                loss = loss / cfg.GRAD_ACCUM_STEPS
             loss.backward()
             if (batch_idx + 1) % cfg.GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(visionmodel.parameters(), max_norm=1.0)
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
             if torch.isnan(logits).any():
                 print("❌ Model produced NaN outputs!")
             losses.append(loss.item() * cfg.GRAD_ACCUM_STEPS)
             pbar.set_postfix({'loss': f'{np.mean(losses):.4f}'})
+        torch.cuda.empty_cache()
 
     return np.mean(losses)
 
@@ -876,14 +891,19 @@ def train_epoch(model, loader, visionmodel, roiextractor, optimizer, criterion, 
 @torch.no_grad()
 def eval_epoch(model, loader, visionmodel, roiextractor, criterion, cfg, iscached=True,dinofold=0):
     model.eval()
+    visionmodel.eval()
     losses = []
     all_preds, all_labels = [], []
 
     for batch in tqdm(loader, desc="Val", leave=False):
         if not iscached:
-            with torch.no_grad():
+            if cfg.USE_AMP:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    batched_features = extract_image_features(batch, visionmodel, roiextractor, caching=False)
+                    batch = batched_features
+            else:
                 batched_features = extract_image_features(batch, visionmodel, roiextractor, caching=False)
-            batch = batched_features
+                batch = batched_features
 
         labels = batch["labels"].to(cfg.DEVICE)
         slices = batch["slices"].to(cfg.DEVICE)
@@ -898,9 +918,10 @@ def eval_epoch(model, loader, visionmodel, roiextractor, criterion, cfg, iscache
         if cfg.USE_AMP:
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)
+                loss = criterion(logits.float(), labels)
         else:
             logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype)
-        loss = criterion(logits.float(), labels)
+            loss = criterion(logits.float(), labels)
         losses.append(loss.item())
 
         if torch.isnan(logits).any():
@@ -1270,7 +1291,43 @@ def precompute_and_save(model, visionmodel, roiextractor, loader, save_path, cfg
         str(save_path),
     )
     print(f"✅ Extracted features saved to {save_path}")
+def LoadRadImageNet(densenet=False):
+    if densenet:
+        model=torchvision.models.densenet121()
+        sd2=torch.load("RadImageNet-DenseNet121.pt")
+        newsd={}
+        for k,v in sd2.items():
+            newk=k.replace("backbone.0","features")
+            newsd[newk]=v
+        xxx=model.load_state_dict(newsd,strict=False)
+        feature_extractor = nn.Sequential(
+            model.features,
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten()
+        )
+        return feature_extractor
+    else:
+        model=torchvision.models.resnet50()
+        model.fc=nn.Identity()
+        sd=model.state_dict()
+        sd2=torch.load("RadImageNet-ResNet50.pt")
+        replacedict={
+            "backbone.0":"conv1",
+            "backbone.1":"bn1",
+            "backbone.4":"layer1",
+            "backbone.5":"layer2",
+            "backbone.6":"layer3",
+            "backbone.7":"layer4",
 
+        }
+        newsd={}
+        for k,v in sd2.items():
+            editedkey=k
+            for kk,vv in replacedict.items():
+                editedkey=editedkey.replace(kk,vv)
+            newsd[editedkey]=v
+        xxx=model.load_state_dict(newsd,strict=False)
+        return model
 
 def main():
     print(torch.__version__)
@@ -1337,14 +1394,9 @@ def main():
     #     gc.collect()
     #     torch.cuda.empty_cache()
     # Create Gold Val DataLoader from cached features
-    # visionmodel = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=0,dynamic_img_size=True)
-    visionmodel = timm.create_model("vit_small_patch16_224", pretrained=True, num_classes=0,
-                                    dynamic_img_size=True, checkpoint_path="radiodinos16.safetensors")
-    # visionmodel.load_state_dict(torch.load(f"radiodinov2_ssl_finetuned_backbone.pth")["model_state_dict"])
-    visionmodel.eval()
-    visionmodel.requires_grad_(False)
-    visionmodel.to(cfg.DEVICE)
-    val_cached_ds = KneeStudyTrainDataset(df_val, df_series, cfg.TRAIN_IMG_DIR, cfg, is_train=False)#CachedEmbeddingDataset("val_feats.pt", cfg, labels_replacement=df_val, label_filter=False)
+
+    val_cached_ds = KneeStudyTrainDataset(df_val, df_series, cfg.TRAIN_IMG_DIR, cfg,
+                                          is_train=False)  # CachedEmbeddingDataset("val_feats.pt", cfg, labels_replacement=df_val, label_filter=False)
     ld_val_gold = DataLoader(
         val_cached_ds,
         batch_size=cfg.BATCH_SIZE,
@@ -1369,6 +1421,18 @@ def main():
     for dinofold in range(1):
         for fold, (train_idx, val_idx) in enumerate(mskf.split(X_dummy, binary_targets)):
             print(f"\n========================== FOLD {fold + 1}/{cfg.NUM_FOLDS} ==========================")
+
+            # # visionmodel = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=0,dynamic_img_size=True)
+            # visionmodel = timm.create_model("vit_small_patch16_224", pretrained=True, num_classes=0,
+            #                                 dynamic_img_size=True, checkpoint_path="radiodinos16.safetensors")
+            # # visionmodel.load_state_dict(torch.load(f"radiodinov2_ssl_finetuned_backbone.pth")["model_state_dict"])
+            # visionmodel=LoadRadImageNet(densenet=False)
+            visionmodel=torchvision.models.resnext50_32x4d(pretrained=False)
+            visionmodel.fc=nn.Identity()
+            testout=visionmodel(torch.rand(1,3,224,224))
+            visionmodel.train()
+            visionmodel.requires_grad_(False)
+            visionmodel.to(cfg.DEVICE)
 
             train_sub = Subset(train_cached_ds, train_idx)
             val_sub = Subset(train_cached_ds, val_idx)
@@ -1397,7 +1461,7 @@ def main():
             print(f"Fold {dinofold}-{fold + 1} - Train samples: {len(train_sub)} | Val samples: {len(val_sub)}")
 
             # Fresh Main Model Instance per Fold
-            model = KneeAbnormalityModelRefactored(cfg,inputdim=384).to(cfg.DEVICE)
+            model = KneeAbnormalityModelRefactored(cfg,inputdim=2048).to(cfg.DEVICE)
             model.train()
             if cfg.LOAD_PATH.exists():
                 model.load_state_dict(torch.load(cfg.LOAD_PATH, weights_only=True)["model_state_dict"], strict=False)
@@ -1406,7 +1470,7 @@ def main():
             total_params = sum(p.numel() for p in model.parameters())
             print(f"Fold {dinofold}-{fold + 1} Model Params: Trainable {trainable_params:,} / Total {total_params:,}")
 
-            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY, eps=1e-6)
             scheduler_cosine = CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=cfg.MIN_LR)
             scheduler_warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=cfg.WARMUP_EPOCHS)
             scheduler = SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[cfg.WARMUP_EPOCHS])
@@ -1415,6 +1479,7 @@ def main():
             valcriterion= torch.nn.MSELoss(reduction="sum")
 
             save_path_fold = str(cfg.PYTHON_DIR / f"best_model_dino_fold_{dinofold}_{fold}.pth")
+            save_path_fold_v = str(cfg.PYTHON_DIR / f"best_vmodel_dino_fold_{dinofold}_{fold}.pth")
             writer = SummaryWriter(comment=f"_Fold_{dinofold}_{fold}")
 
             best_loss = float("inf")
@@ -1423,11 +1488,25 @@ def main():
             best_val_targets = None
             without_save_epochs = 0
             patience = 10
+            for param in visionmodel.parameters():
+                param.requires_grad = False
 
             for epoch in range(cfg.EPOCHS):
                 print(f"\n--- Fold {dinofold}-{fold + 1} | Epoch {epoch + 1}/{cfg.EPOCHS} ---")
                 without_save_epochs += 1
+                if epoch==0:#cfg.WARMUP_EPOCHS
+                    print(" Unfreezing backbone with differential learning rates...")
+                    for param in visionmodel.parameters():
+                        param.requires_grad = True
+                    # for param in model.parameters():
+                    #     param.requires_grad = False
 
+                    optimizer = torch.optim.AdamW([
+                        {'params': visionmodel.parameters(), 'lr': cfg.VLR},  # 1e-6 for backbone
+                        {'params': model.parameters(), 'lr': cfg.LR}            # 1e-4 for head
+                    ], weight_decay=cfg.WEIGHT_DECAY, eps=1e-6)
+
+                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS - 1, eta_min=cfg.MIN_LR)
                 train_loss = train_epoch(model, ld_train, visionmodel, None, optimizer, criterion, scaler, cfg, iscached=False,dinofold=dinofold)
                 val_loss, val_auc, val_preds, val_targets = eval_epoch(model, ld_val, visionmodel, None, criterion, cfg, iscached=False,dinofold=dinofold)
                 gval_loss, gval_auc, gval_preds, gval_targets = eval_epoch(model, ld_val_gold, visionmodel, None, criterion, cfg, iscached=False,dinofold=dinofold)
@@ -1447,7 +1526,7 @@ def main():
                     best_loss = val_loss
 
 
-                if gval_auc > best_auc:
+                if gval_auc > best_auc and epoch>=cfg.WARMUP_EPOCHS:
                     best_auc = gval_auc
                     without_save_epochs = 0
                     best_val_preds = val_preds
@@ -1460,6 +1539,14 @@ def main():
                         'val_auc': float(gval_auc),
                         'val_loss': float(val_loss),
                     }, save_path_fold)
+                    torch.save({
+                        'fold': fold,
+                        'dinofold': dinofold,
+                        'epoch': epoch,
+                        'model_state_dict': visionmodel.state_dict(),
+                        'val_auc': float(gval_auc),
+                        'val_loss': float(val_loss),
+                    }, save_path_fold_v)
                     print(f"  -> Saved new best checkpoint for Fold {dinofold}-{fold + 1} (GOLD AUC: {gval_auc:.4f}) -> {save_path_fold}")
                 if without_save_epochs >= patience:
                     print(f"Early stopping triggered for Fold {dinofold}-{fold + 1} at epoch {epoch + 1}")
@@ -1517,12 +1604,12 @@ def main():
         torch.cuda.empty_cache()
 
     # Create Gold Val DataLoader from cached features
-    val_cached_ds = CachedEmbeddingDataset("val_feats.pt", cfg, labels_replacement=df_val, label_filter=False)
+    val_cached_ds = KneeStudyTrainDataset(df_val, df_series, cfg.TRAIN_IMG_DIR, cfg, is_train=False)#CachedEmbeddingDataset("val_feats.pt", cfg, labels_replacement=df_val, label_filter=False)
     ld_val_gold = DataLoader(
         val_cached_ds,
         batch_size=cfg.BATCH_SIZE,
         shuffle=False,
-        collate_fn=cache_collate_fn,
+        collate_fn=collate_fn,
         num_workers=cfg.NUM_WORKERS
     )
 
@@ -1562,18 +1649,25 @@ def evaluate_ensemble(
     for dinofold in range(1):
         for fold_idx in range(cfg.NUM_FOLDS):
             path=str(cfg.PYTHON_DIR / f"best_model_dino_fold_{dinofold}_{fold_idx}.pth")
+            vpath=str(cfg.PYTHON_DIR / f"best_vmodel_dino_fold_{dinofold}_{fold_idx}.pth")
             if not Path(path).exists():
                 print(f"⚠️ Warning: Checkpoint for fold {fold_idx + 1} not found at {path}. Skipping.")
                 continue
 
             print(f"Loading checkpoint [{fold_idx+dinofold + 1}/{len(fold_paths)}]: {path}")
-            model = model_class(cfg,inputdim=384).to(cfg.DEVICE)
+            model = model_class(cfg,inputdim=2048).to(cfg.DEVICE)
             checkpoint = torch.load(path, map_location=cfg.DEVICE)
             model.load_state_dict(checkpoint['model_state_dict'])
-
+            visionmodel=torchvision.models.resnext50_32x4d(pretrained=False)
+            visionmodel.fc=nn.Identity()
+            vcheckpoint = torch.load(vpath, map_location=cfg.DEVICE)
+            visionmodel.load_state_dict(vcheckpoint['model_state_dict'])
+            testout=visionmodel(torch.rand(1,3,224,224))
+            visionmodel.eval()
+            visionmodel.to(cfg.DEVICE)
             # Predict using current fold model
             val_loss, val_auc, fold_preds, fold_targets = eval_epoch(
-                model, val_loader, visionmodel=None, roiextractor=None, criterion=criterion, cfg=cfg, iscached=True, dinofold=dinofold
+                model, val_loader, visionmodel=visionmodel, roiextractor=None, criterion=criterion, cfg=cfg, iscached=False, dinofold=dinofold
             )
 
             all_fold_preds.append(fold_preds)

@@ -144,10 +144,10 @@ class KneeAbnormalityModelRefactored(nn.Module):
     ):
 
         B, Serie, S, P, C = features.shape
-        feat_attn=features.view(B * Serie * S, P, C)
-        feat_attn=self.feature_attn(feat_attn)
+        # feat_attn=features.view(B * Serie * S, P, C)
+        # feat_attn=self.feature_attn(feat_attn)
         # 1. Feature Extraction per Series
-        feat_flat = feat_attn.view(B * Serie, S, C)
+        feat_flat = features.view(B * Serie, S, C)
         s_mask_flat = slice_mask.view(B * Serie, S)
         type_cond = torch.cat([fluid_sensitive.unsqueeze(-1), fat_suppression.unsqueeze(-1)], dim=-1).view(B * Serie, 2)
         series_features = [
