@@ -13,6 +13,7 @@
       <excludeFolder url="file://$MODULE_DIR$/slicesfeats" />
       <excludeFolder url="file://$MODULE_DIR$/singlelabelmodels" />
       <excludeFolder url="file://$MODULE_DIR$/slicesfeats-s16-orig" />
+      <excludeFolder url="file://$MODULE_DIR$/dicomcaches" />
     </content>
     <orderEntry type="jdk" jdkName="$MODULE_DIR$/.venv" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

@@ -39,7 +39,7 @@ try:
     mp.set_start_method('fork', force=True)
 except RuntimeError:
     pass
-from model_dino_simplified import KneeAbnormalityModelRefactored
+from model_dino_simplified3 import KneeAbnormalityModelRefactored
 
 torch.set_float32_matmul_precision('high')
 warnings.filterwarnings('ignore')
@@ -74,7 +74,7 @@ class Config:
     SLICE_ENC_HEADS = 8
     SLICE_ENC_LAYERS = 2
     DROPOUT = 0.3
-    CROP_SIZE_MM = 80.0
+    CROP_SIZE_MM = 140.0
 
     # ── K-Fold Cross Validation ───────────────────────────────────────
     NUM_FOLDS = 5
@@ -443,62 +443,125 @@ class KneeStudyTrainDataset(Dataset):
                         return 3
                     return 1
             return 0
-
+        addedtypes=[]
         all_slices, all_plane_ids, all_fluids, all_fats, all_stype, all_spacing = [], [], [], [], [], []
-        for sinfo in study['series']:
-            path = self.img_dir / study_id / sinfo['series_id']
-            if not path.exists():
-                continue
-            alldcms = [pydicom.dcmread(str(dcm), stop_before_pixels=True) for dcm in sorted(path.glob('*.dcm'))]
-            valid_slices = [
-                ds for ds in alldcms
-                if "ImagePositionPatient" in ds and "ImageOrientationPatient" in ds
-            ]
+        if Path.exists(f"dicomcaches/{study_id}.pt"):
+            all_slices, all_plane_ids, all_fluids, all_fats, all_stype, all_spacing=torch.load(f"dicomcaches/{study_id}.pt",weights_only=False)
+        else:
+            for sinfo in study['series']:
+                path = self.img_dir / study_id / sinfo['series_id']
+                if not path.exists():
+                    continue
+                alldcms = [pydicom.dcmread(str(dcm), stop_before_pixels=True) for dcm in sorted(path.glob('*.dcm'))]
+                valid_slices = [
+                    ds for ds in alldcms
+                    if "ImagePositionPatient" in ds and "ImageOrientationPatient" in ds
+                ]
 
-            if not valid_slices:
-                raise ValueError("No valid spatial metadata found in the provided DICOM slices.")
-
-            orient = valid_slices[0].ImageOrientationPatient
-            row_cosines = np.array(orient[:3])
-            col_cosines = np.array(orient[3:])
-            slice_normal = np.cross(row_cosines, col_cosines)
-
-            sorted_slices = sorted(
-                valid_slices,
-                key=lambda ds: np.dot(np.array(ds.ImagePositionPatient), slice_normal)
-            )
-            alldcms = sorted_slices
-            if self.cfg.MAX_SLICES_PER_SERIES > 0:
-                if len(alldcms) > self.cfg.MAX_SLICES_PER_SERIES:
-                    indices = np.round(np.linspace(0, len(alldcms) - 1, num=self.cfg.MAX_SLICES_PER_SERIES*3)).astype(int)
-                    dcm_files = [alldcms[i] for i in indices]
-                else:
-                    dcm_files = alldcms
-            else:
-                dcm_files = alldcms
-            slices = []
-            packofthrees=[]
-            for dcm_file in dcm_files:
-                try:
-                    img = self.safe_load_dicom_array(dcm_file.filename)
-                    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-                    img = np.clip(img, 0.0, 1.0)
-                    packofthrees.append(torch.from_numpy(img))
-                    if len(packofthrees)==3:
-                        img = np.stack(packofthrees, axis=0)
-                        packofthrees = []
-                        slices.append(torch.from_numpy(img))
-                except Exception:
+                if not valid_slices:
+                    raise ValueError("No valid spatial metadata found in the provided DICOM slices.")
+                rows=valid_slices[0].Rows
+                columns=valid_slices[0].Columns
+                pixelspacing=valid_slices[0].PixelSpacing
+                xs=[]
+                for k in range(len(valid_slices)):
+                    position = valid_slices[k].ImagePositionPatient
+                    orient = valid_slices[k].ImageOrientationPatient
+                    row_cosines = np.array(orient[:3])
+                    col_cosines = np.array(orient[3:])
+                    patientcenter=position+col_cosines*pixelspacing[1]*(columns/2)+row_cosines*pixelspacing[0]*(rows/2)
+                    xs.append(patientcenter[0])
+                patientcenter=float(np.median(xs))
+                position = valid_slices[0].ImagePositionPatient
+                orient = valid_slices[0].ImageOrientationPatient
+                row_cosines = np.array(orient[:3])
+                col_cosines = np.array(orient[3:])
+                slice_normal = np.cross(row_cosines, col_cosines)
+                echotime=getattr(valid_slices[0], "EchoTime", 0)
+                repititiontime=getattr(valid_slices[0], "RepetitionTime", 0)
+                if patientcenter<=0:
                     pass
+                typeofimaging=None
+                if repititiontime>=800:
+                    typeofimaging=0#T1
+                    if sinfo['plane_id']==0:#sagittal
+                        if sinfo['fluid_sensitive'] and sinfo['fat_suppression']:
+                            typeofimaging=10
+                        else:
+                            typeofimaging=5
+                    elif sinfo['plane_id']==1:#axial
+                        typeofimaging=11
+                    else:#coronal
+                        typeofimaging=4
+                else:
+                    typeofimaging=1#T2 or PD
+                    if sinfo['plane_id']==0:#sagittal
+                        if sinfo['fluid_sensitive'] and sinfo['fat_suppression']:
+                            typeofimaging=0
+                        else:
+                            typeofimaging=3
+                    elif sinfo['plane_id']==1:#axial
+                        if sinfo['fluid_sensitive'] and sinfo['fat_suppression']:
+                            typeofimaging=2
+                        else:
+                            typeofimaging=12
+                    else:#coronal
+                        if sinfo['fluid_sensitive'] and sinfo['fat_suppression']:
+                            typeofimaging=1
+                        else:
+                            typeofimaging=13
+                if typeofimaging<6 and typeofimaging not in addedtypes:
+                    sorted_slices = sorted(
+                        valid_slices,
+                        key=lambda ds: np.dot(np.array(ds.ImagePositionPatient), slice_normal)
+                    )
+                    vflip=False
+                    if patientcenter<0 and abs(patientcenter)>20.0 and (sinfo['plane_id']==1 or sinfo['plane_id']==2):
+                        vflip=True
+                    elif patientcenter<0 and abs(patientcenter)>20.0 and sinfo['plane_id']==0:
+                        sorted_slices=sorted_slices[::-1]
+                    alldcms = sorted_slices
+                    if self.cfg.MAX_SLICES_PER_SERIES > 0:
+                        if len(alldcms) > self.cfg.MAX_SLICES_PER_SERIES:
+                            offset=(len(alldcms)//10)
+                            alldcms=alldcms[offset:-offset]
+                            indices = np.round(np.linspace(0, len(alldcms) - 1, num=self.cfg.MAX_SLICES_PER_SERIES)).astype(int)
+                            dcm_files = [alldcms[i] for i in indices]
+                        else:
+                            dcm_files = alldcms
+                    else:
+                        dcm_files = alldcms
+                    slices = []
+                    # packofthrees=[]
+                    for dcm_file in dcm_files:
+                        try:
+                            img = self.safe_load_dicom_array(dcm_file.filename)
+                            img = (img - img.min()) / (img.max() - img.min() + 1e-3)
+                            img = np.clip(img, 0.0, 1.0)
+                            if vflip:
+                                img = np.fliplr(img).copy()
+                            # img = np.stack([img,img,img], axis=0)
+                            img=img*255.0
+                            img=np.uint8(img)
+                            slices.append(img)
+                            # packofthrees.append(torch.from_numpy(img))
+                            # if len(packofthrees)==3:
+                            #     img = np.stack(packofthrees, axis=0)
+                            #     packofthrees = []
+                            #     slices.append(torch.from_numpy(img))
+                        except Exception:
+                            pass
 
-            dcm = dcm_files[0]
-            all_spacing.append(dcm.PixelSpacing)
-            serietype = identify_sequence_with_binaries(getattr(dcm, "ScanningSequence", ""), sinfo['fluid_sensitive'], sinfo['fat_suppression'], getattr(dcm, "SeriesDescription", ""), getattr(dcm, "SequenceName", ""))
-            all_plane_ids.append(sinfo['plane_id'])
-            all_fluids.append(sinfo['fluid_sensitive'])
-            all_fats.append(sinfo['fat_suppression'])
-            all_slices.append(torch.stack(slices))
-            all_stype.append(serietype)
+                    dcm = dcm_files[0]
+                    all_spacing.append(dcm.PixelSpacing)
+                    serietype = typeofimaging#identify_sequence_with_binaries(getattr(dcm, "ScanningSequence", ""), sinfo['fluid_sensitive'], sinfo['fat_suppression'], getattr(dcm, "SeriesDescription", ""), getattr(dcm, "SequenceName", ""))
+                    all_plane_ids.append(sinfo['plane_id'])
+                    all_fluids.append(sinfo['fluid_sensitive'])
+                    all_fats.append(sinfo['fat_suppression'])
+                    all_slices.append(np.stack(slices))
+                    all_stype.append(serietype)
+                    torch.save((all_slices, all_plane_ids, all_fluids, all_fats, all_stype, all_spacing),f"dicomcaches/{study_id}.pt")
+                    addedtypes.append(typeofimaging)
 
         return {
             'study_id': study_id,
@@ -623,13 +686,16 @@ def extract_image_features(batch, visionmodel, roiextractor, caching=True):
                 listofcrops = []
 
                 # 2. Whole Image / Full Bounding Box Crop
+                crop_h = int(sizemm / pixelspacing[0])
+                crop_w = int(sizemm / pixelspacing[1])
+                offset_h=(cropped.shape[-2]-crop_h)//2
+                offset_w=(cropped.shape[-1]-crop_w)//2
+                cropped=cropped[:,:,offset_h:offset_h+crop_h,offset_w:offset_w+crop_w]
                 squared_whole = pad_to_square(cropped)
                 resized_whole = F.interpolate(squared_whole, (224, 224), mode='bilinear', align_corners=False)
                 listofcrops.append((resized_whole - mean) / std)
 
                 # # 3. Calculate 140mm Patch Dimensions in Pixels
-                # crop_h = int(sizemm / pixelspacing[0])
-                # crop_w = int(sizemm / pixelspacing[1])
                 #
                 # # If image dimension is smaller than patch size, return whole image crop
                 # if c_h < crop_h or c_w < crop_w:
@@ -686,17 +752,17 @@ def extract_image_features(batch, visionmodel, roiextractor, caching=True):
             all_fats = new_fats
             all_stype = new_stype
             seriesizes = [slices_feats[x].shape[0] for x in range(len(slices_feats))]
-            CHUNK_SIZE = 64
-            tovit = torch.cat(slices_feats, dim=0).to(cfg.DEVICE)
-            dino_tokens = []
-            for i in range(0, tovit.size(0), CHUNK_SIZE):
-                chunk = tovit[i: i + CHUNK_SIZE]
-                if cfg.USE_AMP:
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        chunk_out = visionmodel(chunk)
-                else:
-                    chunk_out = visionmodel(chunk)
-                dino_tokens.append(chunk_out.unsqueeze(1).float())
+            # CHUNK_SIZE = 64
+            # tovit = torch.cat(slices_feats, dim=0).to(cfg.DEVICE)
+            # dino_tokens = []
+            # for i in range(0, tovit.size(0), CHUNK_SIZE):
+            #     chunk = tovit[i: i + CHUNK_SIZE]
+            #     if cfg.USE_AMP:
+            #         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            #             chunk_out = visionmodel(chunk)
+            #     else:
+            #         chunk_out = visionmodel(chunk)
+            #     dino_tokens.append(chunk_out.unsqueeze(1).float())
                     # patches = chunk_out[:, 1:, :]
                     #
                     # # Rearrange to spatial grid: (Batch, Channels, Height, Width)
@@ -722,10 +788,10 @@ def extract_image_features(batch, visionmodel, roiextractor, caching=True):
                     #     avg_bottom_right
                     # ], dim=-1)
                     # dino_tokens.append(combined_features.detach().cpu())
-            dino_out = torch.cat(dino_tokens, dim=0).cpu()
-            slices_feats_tmp = list(torch.split(dino_out, seriesizes, dim=0))
-
-            slices_feats=slices_feats_tmp
+            # dino_out = torch.cat(dino_tokens, dim=0).cpu()
+            # slices_feats_tmp = list(torch.split(dino_out, seriesizes, dim=0))
+            #
+            # slices_feats=slices_feats_tmp
             # for dinofeats in slices_feats_tmp:
             #     clstoken=dinofeats[:,0,:]
             #     tokens=[]
@@ -1420,6 +1486,8 @@ def main():
     # ── 3. K-Fold Training Loop ──────────────────────────────────────────────
     for dinofold in range(1):
         for fold, (train_idx, val_idx) in enumerate(mskf.split(X_dummy, binary_targets)):
+            # if fold==0:
+            #     continue
             print(f"\n========================== FOLD {fold + 1}/{cfg.NUM_FOLDS} ==========================")
 
             # # visionmodel = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=0,dynamic_img_size=True)
@@ -1427,8 +1495,8 @@ def main():
             #                                 dynamic_img_size=True, checkpoint_path="radiodinos16.safetensors")
             # # visionmodel.load_state_dict(torch.load(f"radiodinov2_ssl_finetuned_backbone.pth")["model_state_dict"])
             # visionmodel=LoadRadImageNet(densenet=False)
-            visionmodel=timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))
-            # visionmodel.fc=nn.Identity()
+            visionmodel=torchvision.models.resnet18()#timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))
+            visionmodel.fc=nn.Identity()
             testout=visionmodel(torch.rand(1,3,224,224))
             visionmodel.train()
             visionmodel.requires_grad_(False)
@@ -1461,7 +1529,7 @@ def main():
             print(f"Fold {dinofold}-{fold + 1} - Train samples: {len(train_sub)} | Val samples: {len(val_sub)}")
 
             # Fresh Main Model Instance per Fold
-            model = KneeAbnormalityModelRefactored(cfg,inputdim=768).to(cfg.DEVICE)
+            model = KneeAbnormalityModelRefactored(cfg,inputdim=512).to(cfg.DEVICE)
             model.train()
             if cfg.LOAD_PATH.exists():
                 model.load_state_dict(torch.load(cfg.LOAD_PATH, weights_only=True)["model_state_dict"], strict=False)
@@ -1494,7 +1562,7 @@ def main():
             for epoch in range(cfg.EPOCHS):
                 print(f"\n--- Fold {dinofold}-{fold + 1} | Epoch {epoch + 1}/{cfg.EPOCHS} ---")
                 without_save_epochs += 1
-                if epoch==0:#cfg.WARMUP_EPOCHS
+                if epoch==cfg.WARMUP_EPOCHS:#cfg.WARMUP_EPOCHS
                     print(" Unfreezing backbone with differential learning rates...")
                     for param in visionmodel.parameters():
                         param.requires_grad = True
@@ -1504,7 +1572,7 @@ def main():
                     optimizer = torch.optim.AdamW([
                         {'params': visionmodel.parameters(), 'lr': cfg.VLR},  # 1e-6 for backbone
                         {'params': model.parameters(), 'lr': cfg.LR}            # 1e-4 for head
-                    ], weight_decay=cfg.WEIGHT_DECAY, eps=1e-6)
+                    ], weight_decay=cfg.WEIGHT_DECAY)
 
                     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS - 1, eta_min=cfg.MIN_LR)
                 train_loss = train_epoch(model, ld_train, visionmodel, None, optimizer, criterion, scaler, cfg, iscached=False,dinofold=dinofold)
@@ -1655,11 +1723,11 @@ def evaluate_ensemble(
                 continue
 
             print(f"Loading checkpoint [{fold_idx+dinofold + 1}/{len(fold_paths)}]: {path}")
-            model = model_class(cfg,inputdim=768).to(cfg.DEVICE)
+            model = model_class(cfg,inputdim=512).to(cfg.DEVICE)
             checkpoint = torch.load(path, map_location=cfg.DEVICE)
             model.load_state_dict(checkpoint['model_state_dict'])
-            visionmodel=timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))#torchvision.models.resnext50_32x4d(pretrained=False)
-            # visionmodel.fc=nn.Identity()
+            visionmodel=torchvision.models.resnet18()#timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))#torchvision.models.resnext50_32x4d(pretrained=False)
+            visionmodel.fc=nn.Identity()
             vcheckpoint = torch.load(vpath, map_location=cfg.DEVICE)
             visionmodel.load_state_dict(vcheckpoint['model_state_dict'])
             testout=visionmodel(torch.rand(1,3,224,224))
@@ -1718,38 +1786,14 @@ if __name__ == '__main__':
     # print(f"Synovitis: {df_val['Synovitis'].value_counts()}")
     # if cfg.DEBUG_SUBSET:
     #     df_train = df_train.head(cfg.DEBUG_SUBSET)
-    # # ── Feature Caching for Holdout Gold Validation Set ───────────────────────
-    # if not (cfg.PYTHON_DIR / "val_feats.pt").exists():
-    #     print("Caching features for Gold Validation set...")
-    #     dummy_model = KneeAbnormalityModelRefactored(cfg, inputdim=384).to(cfg.DEVICE)
-    #     # visionmodel = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=0,dynamic_img_size=True)
-    #     for idx in range(5):
-    #         visionmodel = timm.create_model("vit_small_patch14_reg4_dinov2.lvd142m", pretrained=True, num_classes=0,
-    #                                         dynamic_img_size=True, checkpoint_path="vit_small_patch14_reg4_dinov2.safetensors")
-    #         #visionmodel.load_state_dict(torch.load(f"radiodinov2_ssl_backbone_fold_{idx}.pth")["model_state_dict"])
-    #         visionmodel.eval()
-    #         visionmodel.requires_grad_(False)
-    #         visionmodel.to(cfg.DEVICE)
-    #
-    #     roiextractor = TorchScriptROIExtractor(
-    #         "yolo_axial.torchscript", "yolo_sagittal.torchscript", "yolo_coronal.torchscript"
-    #     )
-    #     ds_gold = KneeStudyTrainDataset(df_val, df_series, cfg.TRAIN_IMG_DIR, cfg, is_train=False)
-    #     ld_gold_raw = DataLoader(ds_gold, batch_size=1, num_workers=16, shuffle=False, collate_fn=collate_fn)
-    #
-    #     precompute_and_save(dummy_model, visionmodel, roiextractor, ld_gold_raw, (cfg.PYTHON_DIR / "val_feats.pt"),
-    #                         cfg)
-    #     del dummy_model, visionmodel, roiextractor
-    #     gc.collect()
-    #     torch.cuda.empty_cache()
     #
     # # Create Gold Val DataLoader from cached features
-    # val_cached_ds = CachedEmbeddingDataset("val_feats.pt", cfg, labels_replacement=df_val, label_filter=False)
+    # val_cached_ds = KneeStudyTrainDataset(df_val, df_series, cfg.TRAIN_IMG_DIR, cfg, is_train=False)
     # ld_val_gold = DataLoader(
     #     val_cached_ds,
     #     batch_size=cfg.BATCH_SIZE,
     #     shuffle=False,
-    #     collate_fn=cache_collate_fn,
+    #     collate_fn=collate_fn,
     #     num_workers=cfg.NUM_WORKERS
     # )
     #

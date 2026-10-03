@@ -103,7 +103,8 @@ class KneeAbnormalityModelRefactored(nn.Module):
         self.crop_embed = nn.Embedding(7, 8)
         self.fluid_embed = nn.Embedding(2, 4)
         self.fat_embed = nn.Embedding(2, 4)
-        meta_dim = 8 + 8 + 4 + 4  # Total: 24
+        self.serie_embed = nn.Embedding(6, 8)
+        meta_dim = 8 + 8 + 4 + 4 + 8  # Total: 32
         self.feature_attn=MultiHeadAttentionPooling(in_dim=inputdim)
         self.inputdropout = nn.Dropout(0.2)
         num_types = 2
@@ -160,9 +161,10 @@ class KneeAbnormalityModelRefactored(nn.Module):
         c_emb = self.crop_embed(plane_crop_mixed[:, :, 1].long().clamp(0, 6))
         fl_emb = self.fluid_embed(fluid_sensitive.long().clamp(0, 1))
         ft_emb = self.fat_embed(fat_suppression.long().clamp(0, 1))
+        serie_emb=self.serie_embed(serie_type.long().clamp(0, 6))
 
         series_features_combined = torch.cat(series_features, dim=-1)
-        meta_feats = torch.cat([p_emb, c_emb, fl_emb, ft_emb], dim=-1)
+        meta_feats = torch.cat([p_emb, c_emb, fl_emb, ft_emb, serie_emb], dim=-1)
 
         # 3. Projection to 512-dim Space
         combined = torch.cat([series_features_combined, meta_feats], dim=-1)
