@@ -14,6 +14,10 @@
       <excludeFolder url="file://$MODULE_DIR$/singlelabelmodels" />
       <excludeFolder url="file://$MODULE_DIR$/slicesfeats-s16-orig" />
       <excludeFolder url="file://$MODULE_DIR$/dicomcaches" />
+      <excludeFolder url="file://$MODULE_DIR$/coatnet224-alllabels-384imgsize" />
+      <excludeFolder url="file://$MODULE_DIR$/oldruns" />
+      <excludeFolder url="file://$MODULE_DIR$/radiodino" />
+      <excludeFolder url="file://$MODULE_DIR$/trainedmodels" />
     </content>
     <orderEntry type="jdk" jdkName="$MODULE_DIR$/.venv" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

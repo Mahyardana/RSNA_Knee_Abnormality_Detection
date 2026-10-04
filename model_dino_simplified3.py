@@ -100,18 +100,18 @@ class KneeAbnormalityModelRefactored(nn.Module):
 
         self.serie_embed = nn.Embedding(6, 8)
         meta_dim = 8  # Total: 32
-        self.feature_attn=MultiHeadAttentionPooling(in_dim=512)
+        # self.feature_attn=MultiHeadAttentionPooling(in_dim=512)
         self.series_attn=MultiHeadAttentionPooling(in_dim=512+meta_dim)
         self.inputdropout = nn.Dropout(0.2)
         num_types = 2
 
         self.feature_proj = nn.Sequential(
-            nn.Linear(inputdim, 512),
-            nn.Linear(512, 512),
+            nn.Linear(inputdim, num_labels),
         )
 
+        self.inputdim = inputdim
         # Pathology Feature Interaction Module
-        self.fc=nn.Linear(512 + meta_dim, num_labels)
+        self.fc=nn.Linear(num_labels + meta_dim, num_labels)
 
     def forward(
         self,
@@ -122,23 +122,39 @@ class KneeAbnormalityModelRefactored(nn.Module):
         fluid_sensitive,
         fat_suppression,
         plane_crop_mixed,
-        serie_type
+        serie_type,
+        visionmodel=None
     ):
-
-        B, Serie, S, P, C = features.shape
+        if visionmodel is not None:
+            if self.training:
+                B, Serie, S, C, H, W = features.shape
+                features=visionmodel(features.view(B*Serie*S, C, H, W))
+                features=features.view(B,Serie,S,-1)
+            else:
+                B, Serie, S, C, H, W = features.shape
+                N = B * Serie * S
+                features_flat = features.view(N, C, H, W)
+                perm = torch.randperm(N)
+                inv_perm = torch.argsort(perm)
+                shuffled_features = features_flat[perm]
+                shuffled_out = visionmodel(shuffled_features)
+                restored_out = shuffled_out[inv_perm]
+                features=restored_out.view(B,Serie,S,-1)
+        B, Serie, S, C = features.shape
         # feat_attn=features.view(B * Serie * S, P, C)
         # feat_attn=self.feature_attn(feat_attn)
         # 1. Feature Extraction per Series
-        feat_flat = features.view(B * Serie * S, C)
+        attn_out=features.mean(-2).view(B, Serie, -1)
+        feat_flat = attn_out.view(B * Serie, C)
         s_mask_flat = slice_mask.view(B * Serie, S)
-        series_feats=self.feature_proj(feat_flat).view(B * Serie, S, -1)
-        attn_out=self.feature_attn(series_feats, s_mask_flat).view(B, Serie, -1)
+        series_feats=self.feature_proj(feat_flat).view(B , Serie, -1)
+        #self.feature_attn(series_feats, s_mask_flat).view(B, Serie, -1)
         # 2. Categorical Metadata Embeddings
         serie_emb=self.serie_embed(serie_type.long().clamp(0, 6))
 
         # 3. Projection to 512-dim Space
-        combined = torch.cat([attn_out, serie_emb], dim=-1)
+        combined = torch.cat([series_feats, serie_emb], dim=-1)
         # series_embeddings = F.relu(self.feature_proj(combined))
-        attcmb=self.series_attn(combined)
+        #attcmb=self.series_attn(combined,serie_mask)
         # 6. Cross-Pathology Interaction & Prediction
-        return self.fc(attcmb)  # Returns [B, 12]
+        return self.fc(combined.mean(-2))  # Returns [B, 12]
