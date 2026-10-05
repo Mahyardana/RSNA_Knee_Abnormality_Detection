@@ -1540,7 +1540,7 @@ def main():
             #                                 dynamic_img_size=True, checkpoint_path="radiodinos16.safetensors")
             # # visionmodel.load_state_dict(torch.load(f"radiodinov2_ssl_finetuned_backbone.pth")["model_state_dict"])
             # visionmodel=LoadRadImageNet(densenet=False)
-            visionmodel=torchvision.models.efficientnet_v2_s(pretrained=True)#timm.create_model('vit_small_patch14_dinov2', pretrained=True, num_classes=0, img_size=(224,224))#torchvision.models.resnext50_32x4d()#timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))
+            visionmodel=timm.create_model('vit_base_patch14_dinov2', pretrained=True, num_classes=0, img_size=(224,224))#torchvision.models.resnext50_32x4d()#timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))
             visionmodel.classifier=nn.Identity()
             testout=visionmodel(torch.rand(1,3,224,224))
             visionmodel.train()
@@ -1574,7 +1574,7 @@ def main():
             print(f"Fold {dinofold}-{fold + 1} - Train samples: {len(train_sub)} | Val samples: {len(val_sub)}")
 
             # Fresh Main Model Instance per Fold
-            model = KneeAbnormalityModelRefactored(cfg,inputdim=1280).to(cfg.DEVICE)
+            model = KneeAbnormalityModelRefactored(cfg,inputdim=1536).to(cfg.DEVICE)
             model.train()
             if cfg.LOAD_PATH.exists():
                 model.load_state_dict(torch.load(cfg.LOAD_PATH, weights_only=True)["model_state_dict"], strict=False)
@@ -1583,7 +1583,10 @@ def main():
             total_params = sum(p.numel() for p in model.parameters())
             print(f"Fold {dinofold}-{fold + 1} Model Params: Trainable {trainable_params:,} / Total {total_params:,}")
 
-            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY, eps=1e-6)
+            optimizer = torch.optim.AdamW([
+                {'params': visionmodel.parameters(), 'lr': cfg.VLR},  # 1e-6 for backbone
+                {'params': model.parameters(), 'lr': cfg.LR}  # 1e-4 for head
+            ], weight_decay=cfg.WEIGHT_DECAY)
             scheduler_cosine = CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=cfg.MIN_LR)
             scheduler_warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=cfg.WARMUP_EPOCHS)
             scheduler = SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[cfg.WARMUP_EPOCHS])
@@ -1607,19 +1610,32 @@ def main():
             for epoch in range(cfg.EPOCHS):
                 print(f"\n--- Fold {dinofold}-{fold + 1} | Epoch {epoch + 1}/{cfg.EPOCHS} ---")
                 without_save_epochs += 1
-                if epoch==cfg.WARMUP_EPOCHS:#cfg.WARMUP_EPOCHS
-                    print(" Unfreezing backbone with differential learning rates...")
-                    for param in visionmodel.parameters():
-                        param.requires_grad = True
-                    # for param in model.parameters():
-                    #     param.requires_grad = False
+                if epoch%2==0:#cfg.WARMUP_EPOCHS
+                    NUM_BLOCKS_TO_UNFREEZE = epoch//2
 
-                    optimizer = torch.optim.AdamW([
-                        {'params': visionmodel.parameters(), 'lr': cfg.VLR},  # 1e-6 for backbone
-                        {'params': model.parameters(), 'lr': cfg.LR}            # 1e-4 for head
-                    ], weight_decay=cfg.WEIGHT_DECAY)
+                    # Access the blocks sequence from the backbone
+                    # If using the wrapper from the previous prompt, it's model.blocks
+                    # If using a raw timm model directly, it's model.blocks
+                    transformer_blocks = visionmodel.blocks
+                    total_blocks = len(transformer_blocks)
 
-                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS - 1, eta_min=cfg.MIN_LR)
+                    print(f"Unfreezing {NUM_BLOCKS_TO_UNFREEZE} Transformer Block")
+                    # 3. Unfreeze the last N blocks
+                    for i in range(total_blocks - NUM_BLOCKS_TO_UNFREEZE, total_blocks):
+                        for param in transformer_blocks[i].parameters():
+                            param.requires_grad = True
+                    # print(" Unfreezing backbone with differential learning rates...")
+                    # for param in visionmodel.parameters():
+                    #     param.requires_grad = True
+                    # # for param in model.parameters():
+                    # #     param.requires_grad = False
+
+                    # optimizer = torch.optim.AdamW([
+                    #     {'params': visionmodel.parameters(), 'lr': cfg.VLR},  # 1e-6 for backbone
+                    #     {'params': model.parameters(), 'lr': cfg.LR}            # 1e-4 for head
+                    # ], weight_decay=cfg.WEIGHT_DECAY)
+
+                    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS - 1, eta_min=cfg.MIN_LR)
                 train_loss = train_epoch(model, ld_train, visionmodel, None, optimizer, criterion, scaler, cfg, iscached=False,dinofold=dinofold)
                 val_loss, val_auc, val_preds, val_targets = eval_epoch(model, ld_val, visionmodel, None, criterion, cfg, iscached=False,dinofold=dinofold)
                 gval_loss, gval_auc, gval_preds, gval_targets = eval_epoch(model, ld_val_gold, visionmodel, None, criterion, cfg, iscached=False,dinofold=dinofold)
@@ -1769,10 +1785,10 @@ def evaluate_ensemble(
                 continue
 
             print(f"Loading checkpoint [{fold_idx+dinofold + 1}/{len(fold_paths)}]: {path}")
-            model = model_class(cfg,inputdim=1280).to(cfg.DEVICE)
+            model = model_class(cfg,inputdim=1536).to(cfg.DEVICE)
             checkpoint = torch.load(path, map_location=cfg.DEVICE)
             model.load_state_dict(checkpoint['model_state_dict'])
-            visionmodel=torchvision.models.efficientnet_v2_s(pretrained=True)#timm.create_model('vit_small_patch14_dinov2', pretrained=True, num_classes=0, img_size=(224,224))#timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))#torchvision.models.resnext50_32x4d(pretrained=False)
+            visionmodel=timm.create_model('vit_base_patch14_dinov2', pretrained=True, num_classes=0, img_size=(224,224))#timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))#torchvision.models.resnext50_32x4d(pretrained=False)
             visionmodel.classifier=nn.Identity()
             vcheckpoint = torch.load(vpath, map_location=cfg.DEVICE)
             visionmodel.load_state_dict(vcheckpoint['model_state_dict'])
