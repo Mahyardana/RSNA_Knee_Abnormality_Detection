@@ -34,6 +34,7 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler, WeightedRandomS
 from traitlets import Long
 import zstandard as zstd
 import gc
+import torchvision.transforms.v2 as transforms
 
 try:
     mp.set_start_method('fork', force=True)
@@ -42,13 +43,14 @@ except RuntimeError:
 from model_dino_simplified_single import KneeAbnormalityModelRefactored
 
 torch.set_float32_matmul_precision('high')
+torch.backends.cudnn.benchmark = True
 warnings.filterwarnings('ignore')
 
 
 class Config:
     KAGGLE_DIR = Path('/run/media/mahyar/Samsung-990-PRO/Projects/Kaggle/rsna-knee-abnormality-detection')
     PYTHON_DIR = Path('/run/media/mahyar/Samsung-990-PRO/Projects/Python/RSNA Knee Abnormality Detection')
-    TRAIN_CSV = PYTHON_DIR / 'llm_generated_labels_self_v2.csv'
+    TRAIN_CSV = PYTHON_DIR / 'llm_generated_labels_self_v1.csv'
     VAL_CSV = PYTHON_DIR / 'val_gold.csv'
     SERIES_CSV = PYTHON_DIR / 'train_series.csv'
     TRAIN_IMG_DIR = KAGGLE_DIR / 'train_series'
@@ -58,7 +60,7 @@ class Config:
     LOAD_PATH = PYTHON_DIR / f"best_model_dino_label.pth"
 
     # ── Image processing ──────────────────────────────────────────────
-    MAX_SLICES_PER_SERIES = 8
+    MAX_SLICES_PER_SERIES = 24
     MAX_SERIES_PER_STUDY = 32
     LABELS = ['ACL', 'MCL', 'Medial Meniscus', 'Lateral Meniscus',
               'Medial OA', 'Lateral OA', 'PF OA', 'Effusion',
@@ -82,15 +84,15 @@ class Config:
 
     # ── Training hyperparameters ──────────────────────────────────────
     BATCH_SIZE = 1
-    NUM_WORKERS = 0
-    PREFETCH_FACTOR = None
-    GRAD_ACCUM_STEPS = 8
-    WARMUP_EPOCHS = 5
+    NUM_WORKERS = 4
+    PREFETCH_FACTOR = 4
+    GRAD_ACCUM_STEPS = 1
+    WARMUP_EPOCHS = 0
     EPOCHS = 100
     LR = 1e-4
     VLR = 1e-4
-    MIN_LR = 1e-6
-    MIN_VLR = 1e-6
+    MIN_LR = 1e-7
+    MIN_VLR = 1e-7
     WEIGHT_DECAY = 0.01
     USE_AMP = True
 
@@ -104,8 +106,33 @@ class Config:
 
 
 cfg = Config()
+def foreground_zscore(x: torch.Tensor) -> torch.Tensor:
+    """Z-score normalization applied strictly to non-zero foreground voxels."""
+    x = x.float()
+    mask = x > 0
+    if mask.sum() > 1:
+        fg = x[mask]
+        mean = fg.mean()
+        std = fg.std()
+        out = (x - mean) / (std + 1e-3)
+    else:
+        out = (x - x.mean()) / (x.std() + 1e-3)
+    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).clamp(-20.0, 20.0)
 
 
+BACKBONE_FEAT_DIM = 2048#768 #+ 512
+
+
+def build_backbones(pretrained=True):
+    swin = torchvision.models.swin_v2_t(weights=torchvision.models.Swin_V2_T_Weights.DEFAULT if pretrained else None)
+    swin.head = nn.Identity()  # 768-d pooled features instead of 1000 ImageNet logits
+    maxvit = torchvision.models.maxvit_t(weights=torchvision.models.MaxVit_T_Weights.DEFAULT if pretrained else None)
+    maxvit.classifier[-1] = nn.Identity()  # 512-d features instead of 1000 ImageNet logits
+    resnet= torchvision.models.resnet50(pretrained=pretrained)
+    resnet.fc=nn.Identity()
+    return resnet, maxvit
+inference_transforms: torchvision.transforms = None
+train_transforms: torchvision.transforms = None
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -420,6 +447,8 @@ class KneeStudyTrainDataset(Dataset):
             arr = ds.pixel_array.astype(np.float32)
             if ds.get("PhotometricInterpretation", "MONOCHROME2") == "MONOCHROME1":
                 arr = arr.max() - arr
+            # if ds.pixel_array.dtype != np.uint16:
+            #     pass
             return arr
         except Exception:
             return None
@@ -447,9 +476,9 @@ class KneeStudyTrainDataset(Dataset):
         all_slices, all_plane_ids, all_fluids, all_fats, all_stype, all_spacing = [], [], [], [], [], []
         if study_id in self.cache:
             all_slices, all_plane_ids, all_fluids, all_fats, all_stype, all_spacing = self.cache[study_id]
-        if Path.exists(f"dicomcaches/{study_id}.pt"):
-            all_slices, all_plane_ids, all_fluids, all_fats, all_stype, all_spacing=torch.load(f"dicomcaches/{study_id}.pt",weights_only=False)
-            self.cache[study_id] = all_slices, all_plane_ids, all_fluids, all_fats, all_stype, all_spacing
+        if Path.exists(f"../RSNA Knee Abnormality Detection/dicomcaches/{study_id}.pt"):
+            all_slices, all_plane_ids, all_fluids, all_fats, all_stype, all_spacing=torch.load(f"../RSNA Knee Abnormality Detection/dicomcaches/{study_id}.pt",weights_only=False)
+            # self.cache[study_id] = all_slices, all_plane_ids, all_fluids, all_fats, all_stype, all_spacing
         else:
             for sinfo in study['series']:
                 path = self.img_dir / study_id / sinfo['series_id']
@@ -489,11 +518,11 @@ class KneeStudyTrainDataset(Dataset):
                     typeofimaging=0#T1
                     if sinfo['plane_id']==0:#sagittal
                         if sinfo['fluid_sensitive'] and sinfo['fat_suppression']:
-                            typeofimaging=10
+                            typeofimaging=6
                         else:
                             typeofimaging=5
                     elif sinfo['plane_id']==1:#axial
-                        typeofimaging=11
+                        typeofimaging=7
                     else:#coronal
                         typeofimaging=4
                 else:
@@ -507,13 +536,13 @@ class KneeStudyTrainDataset(Dataset):
                         if sinfo['fluid_sensitive'] and sinfo['fat_suppression']:
                             typeofimaging=2
                         else:
-                            typeofimaging=12
+                            typeofimaging=8
                     else:#coronal
                         if sinfo['fluid_sensitive'] and sinfo['fat_suppression']:
                             typeofimaging=1
                         else:
-                            typeofimaging=13
-                if typeofimaging<6 and typeofimaging not in addedtypes:
+                            typeofimaging=9
+                if typeofimaging not in addedtypes:
                     sorted_slices = sorted(
                         valid_slices,
                         key=lambda ds: np.dot(np.array(ds.ImagePositionPatient), slice_normal)
@@ -539,13 +568,13 @@ class KneeStudyTrainDataset(Dataset):
                     for dcm_file in dcm_files:
                         try:
                             img = self.safe_load_dicom_array(dcm_file.filename)
-                            img = (img - img.min()) / (img.max() - img.min() + 1e-3)
-                            img = np.clip(img, 0.0, 1.0)
+                            # img = (img - img.min()) / (img.max() - img.min()+1e-5)
+                            # img = np.clip(img, 0.0, 1.0)
                             if vflip:
                                 img = np.fliplr(img).copy()
                             # img = np.stack([img,img,img], axis=0)
-                            img=img*255.0
-                            img=np.uint8(img)
+                            # img=img*65535.0
+                            # img=np.uint16(img)
                             slices.append(img)
                             # packofthrees.append(torch.from_numpy(img))
                             # if len(packofthrees)==3:
@@ -556,17 +585,36 @@ class KneeStudyTrainDataset(Dataset):
                             pass
 
                     dcm = dcm_files[0]
+                    serieslices=np.stack(slices)
+                    # vmin_raw = serieslices.min()
+
+                    # if vmin_raw < 0:
+                        # For signed data (int16), background is usually the lowest value
+                        # tissue_mask = serieslices > (vmin_raw * 0.9)
+                    # else:
+                        # For unsigned data (uint16/float32), background is near 0
+                        # tissue_mask = serieslices > (serieslices.mean() * 0.1)
+
+                    # 3. Calculate Z-score parameters strictly from the tissue
+                    # tissue_mean = serieslices[tissue_mask].mean()
+                    # tissue_std = serieslices[tissue_mask].std()
+                    # normalized_volume = (serieslices - tissue_mean) / (tissue_std + 1e-4)
+                    serieslices=(serieslices - serieslices.min()) / (serieslices.max() - serieslices.min() + 1e-5)
+                    serieslices = np.clip(serieslices, 0.0, 1.0)
+                    serieslices = serieslices * 65535.0
+                    serieslices = np.uint16(serieslices)
                     all_spacing.append(dcm.PixelSpacing)
                     serietype = typeofimaging#identify_sequence_with_binaries(getattr(dcm, "ScanningSequence", ""), sinfo['fluid_sensitive'], sinfo['fat_suppression'], getattr(dcm, "SeriesDescription", ""), getattr(dcm, "SequenceName", ""))
                     all_plane_ids.append(sinfo['plane_id'])
                     all_fluids.append(sinfo['fluid_sensitive'])
                     all_fats.append(sinfo['fat_suppression'])
-                    all_slices.append(np.stack(slices))
+                    all_slices.append(serieslices)
                     all_stype.append(serietype)
-                    torch.save((all_slices, all_plane_ids, all_fluids, all_fats, all_stype, all_spacing),f"dicomcaches/{study_id}.pt")
-                    addedtypes.append(typeofimaging)
+                    # addedtypes.append(typeofimaging)
+            if all_slices:
+                torch.save((all_slices, all_plane_ids, all_fluids, all_fats, all_stype, all_spacing),f"../RSNA Knee Abnormality Detection/dicomcaches/{study_id}.pt")
 
-        return {
+        ds_out= {
             'study_id': study_id,
             'slices': all_slices,
             'plane_ids': torch.tensor(all_plane_ids, dtype=torch.long),
@@ -576,6 +624,7 @@ class KneeStudyTrainDataset(Dataset):
             'labels': torch.tensor(labels, dtype=torch.float32),
             'pixel_spacing': all_spacing,
         }
+        return extract_image_features_ds(ds_out, None, None, caching=False)
 
 
 def collate_fn(batch: List[Dict]) -> Dict:
@@ -586,16 +635,20 @@ def collate_fn(batch: List[Dict]) -> Dict:
     fats = [x["fat_suppression"] for x in batch]
     stype = [x["serie_type"] for x in batch]
     labels = [x["labels"] for x in batch]
-    pixel_spacing = [x["pixel_spacing"] for x in batch]
+    slicemasks = [x["slicemasks"] for x in batch]
+    seriemasks = [x["seriemasks"] for x in batch]
+    plane_crop_mixed = [x["plane_crop_mixed"] for x in batch]
     return {
         "study_id": studies,
         "labels": torch.stack(labels, dim=0),
-        "plane_ids": plane_ids,
-        "fluid_sensitive": fluids,
-        "fat_suppression": fats,
-        "serie_type": stype,
-        "slices": slices,
-        "pixel_spacing": pixel_spacing,
+        "plane_ids": torch.stack(plane_ids),
+        "fluid_sensitive": torch.stack(fluids),
+        "fat_suppression": torch.stack(fats),
+        "serie_type": torch.stack(stype),
+        "slices": torch.stack(slices),
+        "slicemasks": torch.stack(slicemasks),
+        "seriemasks": torch.stack(seriemasks),
+        "plane_crop_mixed":torch.stack(plane_crop_mixed),
     }
 
 
@@ -622,228 +675,233 @@ def compute_class_weights(df, cfg):
 featurecache = {}
 
 @torch.no_grad()
-def extract_image_features(batch, visionmodel, roiextractor, caching=True):
-    batched_slices = batch["slices"]
-    batched_plane_ids = batch["plane_ids"]
-    batched_fluids = batch["fluid_sensitive"]
-    batched_fats = batch["fat_suppression"]
-    batched_stype = batch["serie_type"]
-    batched_labels = batch["labels"]
-    batched_studies = batch["study_id"]
-    batched_spacing = batch["pixel_spacing"]
+def extract_image_features_ds(batch, visionmodel, roiextractor, caching=True):
+    slices = batch["slices"]
+    plane_ids = batch["plane_ids"]
+    fluids = batch["fluid_sensitive"]
+    fats = batch["fat_suppression"]
+    stype = batch["serie_type"]
+    labels = batch["labels"]
+    study_id = batch["study_id"]
+    spacing = batch["pixel_spacing"]
 
-    studies, slices, slicemasks, plane_ids, fluids, fats, stype, plane_crop_mixed = [], [], [], [], [], [], [], []
-    for study, all_slices, all_plane_ids, all_fluids, all_fats, all_stype, all_spacing in zip(batched_studies, batched_slices, batched_plane_ids, batched_fluids, batched_fats, batched_stype, batched_spacing):
-        study_id = study
-        if study_id not in featurecache:
-            # xxxxxx = [
-            #     roiextractor.extract_best_roi_crops(x, "sagittal" if y == 0 else "axial" if y == 1 else "coronal")
-            #     for x, y in zip(all_slices, all_plane_ids)
-            # ]
+    if study_id not in featurecache:
+        # xxxxxx = [
+        #     roiextractor.extract_best_roi_crops(x, "sagittal" if y == 0 else "axial" if y == 1 else "coronal")
+        #     for x, y in zip(all_slices, all_plane_ids)
+        # ]
 
-            def crop_and_resize_box(
-                    input_tensor: torch.Tensor,
-                    box: list = None,
-                    pixelspacing: list = [0.5, 0.5],
-                    sizemm: float = 140.0,
-                    boundary_expansion: float = 0.0
-            ):
+        def crop_and_resize_box(
+                input_tensor: torch.Tensor,
+                box: list = None,
+                pixelspacing: list = [0.5, 0.5],
+                sizemm: float = 140.0,
+                boundary_expansion: float = 0.0
+        ):
 
-                if input_tensor.dim() == 3:
-                    input_tensor = input_tensor.unsqueeze(0)
+            if input_tensor.dim() == 3:
+                input_tensor = input_tensor.unsqueeze(0)
 
-                _, ch_img, h_img, w_img = input_tensor.shape
-                input_tensor=input_tensor.float()/255.0
-                # 1. Parse bounding box or default to full image
-                if box is not None and len(box) >= 4:
-                    minx, minh, maxx, maxh = box[:4]
-                    xlen, hlen = maxx - minx, maxh - minh
-                    minx = max(0, int(minx - xlen * boundary_expansion))
-                    minh = max(0, int(minh - hlen * boundary_expansion))
-                    maxx = min(w_img, int(maxx + xlen * boundary_expansion))
-                    maxh = min(h_img, int(maxh + hlen * boundary_expansion))
-                    cropped = input_tensor[:, :, minh:maxh, minx:maxx]
-                    if cropped.shape[-2] == 0 or cropped.shape[-1] == 0:
-                        cropped = input_tensor
-                else:
+            _, ch_img, h_img, w_img = input_tensor.shape
+            input_tensor=input_tensor.float()/65535.0
+            # 1. Parse bounding box or default to full image
+            if box is not None and len(box) >= 4:
+                minx, minh, maxx, maxh = box[:4]
+                xlen, hlen = maxx - minx, maxh - minh
+                minx = max(0, int(minx - xlen * boundary_expansion))
+                minh = max(0, int(minh - hlen * boundary_expansion))
+                maxx = min(w_img, int(maxx + xlen * boundary_expansion))
+                maxh = min(h_img, int(maxh + hlen * boundary_expansion))
+                cropped = input_tensor[:, :, minh:maxh, minx:maxx]
+                if cropped.shape[-2] == 0 or cropped.shape[-1] == 0:
                     cropped = input_tensor
-
-                c_h, c_w = cropped.shape[-2], cropped.shape[-1]
-                device = input_tensor.device
-                mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, ch_img, 1, 1)
-                std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, ch_img, 1, 1)
-
-                # Helper function: Centered replicate padding (prevents high-contrast black edges)
-                def pad_to_square(img):
-                    h, w = img.shape[-2], img.shape[-1]
-                    if h == w:
-                        return img
-                    diff = abs(h - w)
-                    if h < w:
-                        pad_top = diff // 2
-                        pad_bottom = diff - pad_top
-                        return F.pad(img, (0, 0, pad_top, pad_bottom), mode='replicate')
-                    else:
-                        pad_left = diff // 2
-                        pad_right = diff - pad_left
-                        return F.pad(img, (pad_left, pad_right, 0, 0), mode='replicate')
-
-                listofcrops = []
-
-                # 2. Whole Image / Full Bounding Box Crop
-                crop_h = int(sizemm / pixelspacing[0])
-                crop_w = int(sizemm / pixelspacing[1])
-                offset_h=(cropped.shape[-2]-crop_h)//2
-                offset_w=(cropped.shape[-1]-crop_w)//2
-                cropped=cropped[:,:,offset_h:offset_h+crop_h,offset_w:offset_w+crop_w]
-                squared_whole = pad_to_square(cropped)
-                resized_whole = F.interpolate(squared_whole, (224, 224), mode='bilinear', align_corners=False)
-                listofcrops.append((resized_whole - mean) / std)
-
-                # # 3. Calculate 140mm Patch Dimensions in Pixels
-                #
-                # # If image dimension is smaller than patch size, return whole image crop
-                # if c_h < crop_h or c_w < crop_w:
-                #     return listofcrops
-                #
-                # stride_h = crop_h // 2
-                # stride_w = crop_w // 2
-                #
-                # # 4. Generate Coordinates with Boundary Clamping (Guarantees exact 140mm patches)
-                # h_starts = list(range(0, c_h - crop_h + 1, stride_h))
-                # if h_starts[-1] + crop_h < c_h:
-                #     h_starts.append(c_h - crop_h)
-                #
-                # w_starts = list(range(0, c_w - crop_w + 1, stride_w))
-                # if w_starts[-1] + crop_w < c_w:
-                #     w_starts.append(c_w - crop_w)
-                #
-                # # 5. Extract Sliding 140mm Patches
-                # for h in h_starts:
-                #     for w in w_starts:
-                #         patch = cropped[:, :, h: h + crop_h, w: w + crop_w]
-                #         resized_patch = F.interpolate(patch, (224, 224), mode='bilinear', align_corners=False)
-                #         listofcrops.append((resized_patch - mean) / std)
-
-                return listofcrops
-
-            slices_feats, new_plane_crop_mixed, new_plane_ids, new_fluids, new_fats, new_stype = [], [], [], [], [], []
-            rev_class_map = {"whole": 0, "anterior": 1, "medial": 2, "lateral": 3, "back": 4, "front": 5}
-            # expansionfactors=[0.1]#-0.1,0.0,
-            # for expansionfactor in expansionfactors:
-            for idx, (y, z) in enumerate(zip(all_slices, all_spacing)):
-                # for k, v in x.items():
-                #     tovit = crop_and_resize_box(y, v, z, boundryexpantion=expansionfactor)
-                #     if tovit is not None:
-                #         slices_feats.append(tovit.detach().cpu())
-                #         new_plane_crop_mixed.append([all_plane_ids[idx], rev_class_map[k]])
-                #         new_plane_ids.append(all_plane_ids[idx])
-                #         new_fluids.append(all_fluids[idx])
-                #         new_fats.append(all_fats[idx])
-                #         new_stype.append(all_stype[idx])
-                #         del tovit
-                y=torch.from_numpy(y)
-                y=torch.stack([torch.stack([x,x,x]) for x in y])
-                tovit = crop_and_resize_box(y, torch.tensor([0, 0, y.shape[-1], y.shape[-2]], dtype=torch.float), z,sizemm=cfg.CROP_SIZE_MM)
-                for vitout in tovit:
-                    slices_feats.append(vitout)
-                    new_plane_crop_mixed.append([all_plane_ids[idx], rev_class_map['whole']])
-                    new_plane_ids.append(all_plane_ids[idx])
-                    new_fluids.append(all_fluids[idx])
-                    new_fats.append(all_fats[idx])
-                    new_stype.append(all_stype[idx])
-                del tovit
-
-            all_plane_ids = new_plane_ids
-            all_fluids = new_fluids
-            all_fats = new_fats
-            all_stype = new_stype
-            seriesizes = [slices_feats[x].shape[0] for x in range(len(slices_feats))]
-            # CHUNK_SIZE = 64
-            # tovit = torch.cat(slices_feats, dim=0).to(cfg.DEVICE)
-            # dino_tokens = []
-            # for i in range(0, tovit.size(0), CHUNK_SIZE):
-            #     chunk = tovit[i: i + CHUNK_SIZE]
-            #     if cfg.USE_AMP:
-            #         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            #             chunk_out = visionmodel(chunk)
-            #     else:
-            #         chunk_out = visionmodel(chunk)
-            #     dino_tokens.append(chunk_out.unsqueeze(1).float())
-                    # patches = chunk_out[:, 1:, :]
-                    #
-                    # # Rearrange to spatial grid: (Batch, Channels, Height, Width)
-                    # # (B, 196, 384) -> (B, 384, 196) -> (B, 384, 14, 14)
-                    # spatial_grid = patches.transpose(1, 2).view(-1, 384, 14, 14)
-                    # top_left = spatial_grid[:, :, 0:7, 0:7]  # Rows 0-6, Cols 0-6
-                    # top_right = spatial_grid[:, :, 0:7, 7:14]  # Rows 0-6, Cols 7-13
-                    # bottom_left = spatial_grid[:, :, 7:14, 0:7]  # Rows 7-13, Cols 0-6
-                    # bottom_right = spatial_grid[:, :, 7:14, 7:14]  # Rows 7-13, Cols 7-13
-                    # middle = spatial_grid[:, :, 3:10, 3:10]  # Rows 3-9, Cols 3-9
-                    # avg_top_left = top_left.mean(dim=[-2, -1])
-                    # avg_top_right = top_right.mean(dim=[-2, -1])
-                    # avg_bottom_left = bottom_left.mean(dim=[-2, -1])
-                    # avg_bottom_right = bottom_right.mean(dim=[-2, -1])
-                    # avg_middle = middle.mean(dim=[-2, -1])
-                    # cls_token = chunk_out[:, 0, :]
-                    # combined_features = torch.cat([
-                    #     cls_token,
-                    #     avg_middle,
-                    #     avg_top_left,
-                    #     avg_top_right,
-                    #     avg_bottom_left,
-                    #     avg_bottom_right
-                    # ], dim=-1)
-                    # dino_tokens.append(combined_features.detach().cpu())
-            # dino_out = torch.cat(dino_tokens, dim=0).cpu()
-            # slices_feats_tmp = list(torch.split(dino_out, seriesizes, dim=0))
-            #
-            # slices_feats=slices_feats_tmp
-            # for dinofeats in slices_feats_tmp:
-            #     clstoken=dinofeats[:,0,:]
-            #     tokens=[]
-            #     dinotrans=dinofeats[:,1:,:].view(dinofeats.shape[0], 32,32,384)
-            #     for x in range(0,32,8):
-            #         for y in range(0,32,8):
-            #             ct=dinotrans[:,x:x+8,y:y+8,:]
-            #             ctavg=ct.mean(dim=[-3,-2])
-            #             tokens.append(ctavg.unsqueeze(1))
-            #     tokens.append(clstoken.unsqueeze(1))
-            #     slices_feats.append(torch.cat(tokens, dim=1))
-            # del tovit
-            if caching:
-                featurecache[study_id] = slices_feats, new_plane_crop_mixed, new_plane_ids, new_fluids, new_fats, new_stype
-        else:
-            slices_feats, new_plane_crop_mixed, new_plane_ids, new_fluids, new_fats, new_stype = featurecache[study_id]
-        if len(all_slices) == 0:
-            all_slices.append(torch.zeros(3, 224, 224))
-            all_plane_ids.append(0)
-            all_fluids.append(0)
-            all_fats.append(0)
-            all_stype.append(0)
-
-        max_slice = max(slice.shape[0] for slice in all_slices)
-        masks = []
-        for idx in range(len(slices_feats)):
-            if slices_feats[idx].shape[0] < max_slice:
-                s = slices_feats[idx].shape[0]
-                sizediff = max_slice - s
-                slices_feats[idx] = torch.cat([slices_feats[idx], torch.zeros((sizediff, slices_feats[idx].shape[-3], slices_feats[idx].shape[-2], slices_feats[idx].shape[-1]))], dim=0)
-                masks.append(torch.cat([torch.ones(s, dtype=torch.bool), torch.zeros(sizediff, dtype=torch.bool)]))
             else:
-                masks.append(torch.ones(slices_feats[idx].shape[0], dtype=torch.bool))
-        incpufeats = torch.stack(slices_feats).cpu()
-        studies.append(study_id)
-        slices.append(incpufeats)
-        slicemasks.append(torch.stack(masks))
-        plane_ids.append(torch.tensor(new_plane_ids, dtype=torch.long))
-        fats.append(torch.tensor(new_fats, dtype=torch.long))
-        fluids.append(torch.tensor(new_fluids, dtype=torch.long))
-        stype.append(torch.tensor(new_stype, dtype=torch.long))
-        plane_crop_mixed.append(torch.tensor(new_plane_crop_mixed, dtype=torch.long))
+                cropped = input_tensor
+
+            c_h, c_w = cropped.shape[-2], cropped.shape[-1]
+            device = input_tensor.device
+            mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+            # Helper function: Centered replicate padding (prevents high-contrast black edges)
+            def pad_to_square(img):
+                h, w = img.shape[-2], img.shape[-1]
+                if h == w:
+                    return img
+                diff = abs(h - w)
+                if h < w:
+                    pad_top = diff // 2
+                    pad_bottom = diff - pad_top
+                    return F.pad(img, (0, 0, pad_top, pad_bottom), mode='replicate')
+                else:
+                    pad_left = diff // 2
+                    pad_right = diff - pad_left
+                    return F.pad(img, (pad_left, pad_right, 0, 0), mode='replicate')
+
+            listofcrops = []
+
+            # 2. Whole Image / Full Bounding Box Crop
+            crop_h = int(sizemm / pixelspacing[0])
+            crop_w = int(sizemm / pixelspacing[1])
+            squared_whole = pad_to_square(cropped)
+            offset_h=(squared_whole.shape[-2]-crop_h)//2
+            offset_w=(squared_whole.shape[-1]-crop_w)//2
+            squared_whole=squared_whole[:,:,offset_h:offset_h+crop_h,offset_w:offset_w+crop_w]
+            resized_whole = F.interpolate(squared_whole, (384, 384), mode='bilinear', align_corners=False)
+            # listofcrops.append((resized_whole - mean) / std)
+            listofcrops.append(resized_whole)
+
+            # # 3. Calculate 140mm Patch Dimensions in Pixels
+            #
+            # # If image dimension is smaller than patch size, return whole image crop
+            # if c_h < crop_h or c_w < crop_w:
+            #     return listofcrops
+            #
+            # stride_h = crop_h // 2
+            # stride_w = crop_w // 2
+            #
+            # # 4. Generate Coordinates with Boundary Clamping (Guarantees exact 140mm patches)
+            # h_starts = list(range(0, c_h - crop_h + 1, stride_h))
+            # if h_starts[-1] + crop_h < c_h:
+            #     h_starts.append(c_h - crop_h)
+            #
+            # w_starts = list(range(0, c_w - crop_w + 1, stride_w))
+            # if w_starts[-1] + crop_w < c_w:
+            #     w_starts.append(c_w - crop_w)
+            #
+            # # 5. Extract Sliding 140mm Patches
+            # for h in h_starts:
+            #     for w in w_starts:
+            #         patch = cropped[:, :, h: h + crop_h, w: w + crop_w]
+            #         resized_patch = F.interpolate(patch, (224, 224), mode='bilinear', align_corners=False)
+            #         listofcrops.append((resized_patch - mean) / std)
+
+            return listofcrops
+
+        slices_feats, new_plane_crop_mixed, new_plane_ids, new_fluids, new_fats, new_stype = [], [], [], [], [], []
+        rev_class_map = {"whole": 0, "anterior": 1, "medial": 2, "lateral": 3, "back": 4, "front": 5}
+        # expansionfactors=[0.1]#-0.1,0.0,
+        # for expansionfactor in expansionfactors:
+        for idx, (y, z) in enumerate(zip(slices, spacing)):
+            # for k, v in x.items():
+            #     tovit = crop_and_resize_box(y, v, z, boundryexpantion=expansionfactor)
+            #     if tovit is not None:
+            #         slices_feats.append(tovit.detach().cpu())
+            #         new_plane_crop_mixed.append([all_plane_ids[idx], rev_class_map[k]])
+            #         new_plane_ids.append(all_plane_ids[idx])
+            #         new_fluids.append(all_fluids[idx])
+            #         new_fats.append(all_fats[idx])
+            #         new_stype.append(all_stype[idx])
+            #         del tovit
+            y=torch.from_numpy(y)
+            newy = []
+            for idx2 in range(0,len(y),2):  # stride 2: overlapping triplets keep slice continuity
+                # if idx2==len(y)-1:
+                    # newy.append(torch.stack([y[idx2-1], y[idx2], y[idx2]]))
+                    # pass
+                # elif idx2==0:
+                    # newy.append(torch.stack([y[idx2],y[idx2],y[idx2+1]]))
+                    # pass
+                # else:
+                if idx2+2<len(y):
+                    newy.append(torch.stack([y[idx2], y[idx2+1], y[idx2+2]]))
+                    pass
+            # y=torch.stack([torch.stack([x,x,x]) for x in y])
+            y=torch.stack(newy)
+            tovit = crop_and_resize_box(y, torch.tensor([0, 0, y.shape[-1], y.shape[-2]], dtype=torch.float), z,sizemm=cfg.CROP_SIZE_MM)
+            for vitout in tovit:
+                slices_feats.append(vitout)
+                new_plane_crop_mixed.append([plane_ids[idx], rev_class_map['whole']])
+                new_plane_ids.append(plane_ids[idx])
+                new_fluids.append(fluids[idx])
+                new_fats.append(fats[idx])
+                new_stype.append(stype[idx])
+            del tovit
+
+        all_plane_ids = new_plane_ids
+        all_fluids = new_fluids
+        all_fats = new_fats
+        all_stype = new_stype
+        seriesizes = [slices_feats[x].shape[0] for x in range(len(slices_feats))]
+        # CHUNK_SIZE = 64
+        # tovit = torch.cat(slices_feats, dim=0).to(cfg.DEVICE)
+        # dino_tokens = []
+        # for i in range(0, tovit.size(0), CHUNK_SIZE):
+        #     chunk = tovit[i: i + CHUNK_SIZE]
+        #     if cfg.USE_AMP:
+        #         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        #             chunk_out = visionmodel(chunk)
+        #     else:
+        #         chunk_out = visionmodel(chunk)
+        #     dino_tokens.append(chunk_out.unsqueeze(1).float())
+                # patches = chunk_out[:, 1:, :]
+                #
+                # # Rearrange to spatial grid: (Batch, Channels, Height, Width)
+                # # (B, 196, 384) -> (B, 384, 196) -> (B, 384, 14, 14)
+                # spatial_grid = patches.transpose(1, 2).view(-1, 384, 14, 14)
+                # top_left = spatial_grid[:, :, 0:7, 0:7]  # Rows 0-6, Cols 0-6
+                # top_right = spatial_grid[:, :, 0:7, 7:14]  # Rows 0-6, Cols 7-13
+                # bottom_left = spatial_grid[:, :, 7:14, 0:7]  # Rows 7-13, Cols 0-6
+                # bottom_right = spatial_grid[:, :, 7:14, 7:14]  # Rows 7-13, Cols 7-13
+                # middle = spatial_grid[:, :, 3:10, 3:10]  # Rows 3-9, Cols 3-9
+                # avg_top_left = top_left.mean(dim=[-2, -1])
+                # avg_top_right = top_right.mean(dim=[-2, -1])
+                # avg_bottom_left = bottom_left.mean(dim=[-2, -1])
+                # avg_bottom_right = bottom_right.mean(dim=[-2, -1])
+                # avg_middle = middle.mean(dim=[-2, -1])
+                # cls_token = chunk_out[:, 0, :]
+                # combined_features = torch.cat([
+                #     cls_token,
+                #     avg_middle,
+                #     avg_top_left,
+                #     avg_top_right,
+                #     avg_bottom_left,
+                #     avg_bottom_right
+                # ], dim=-1)
+                # dino_tokens.append(combined_features.detach().cpu())
+        # dino_out = torch.cat(dino_tokens, dim=0).cpu()
+        # slices_feats_tmp = list(torch.split(dino_out, seriesizes, dim=0))
+        #
+        # slices_feats=slices_feats_tmp
+        # for dinofeats in slices_feats_tmp:
+        #     clstoken=dinofeats[:,0,:]
+        #     tokens=[]
+        #     dinotrans=dinofeats[:,1:,:].view(dinofeats.shape[0], 32,32,384)
+        #     for x in range(0,32,8):
+        #         for y in range(0,32,8):
+        #             ct=dinotrans[:,x:x+8,y:y+8,:]
+        #             ctavg=ct.mean(dim=[-3,-2])
+        #             tokens.append(ctavg.unsqueeze(1))
+        #     tokens.append(clstoken.unsqueeze(1))
+        #     slices_feats.append(torch.cat(tokens, dim=1))
+        # del tovit
+        if caching:
+            featurecache[study_id] = slices_feats, new_plane_crop_mixed, new_plane_ids, new_fluids, new_fats, new_stype
+    else:
+        slices_feats, new_plane_crop_mixed, new_plane_ids, new_fluids, new_fats, new_stype = featurecache[study_id]
+
+    max_slice = max(max(slice.shape[0] for slice in slices_feats),cfg.MAX_SLICES_PER_SERIES)
+    masks = []
+    for idx in range(len(slices_feats)):
+        if slices_feats[idx].shape[0] < max_slice:
+            s = slices_feats[idx].shape[0]
+            sizediff = max_slice - s
+            slices_feats[idx] = torch.cat([slices_feats[idx], torch.zeros((sizediff, slices_feats[idx].shape[-3], slices_feats[idx].shape[-2], slices_feats[idx].shape[-1]))], dim=0)
+            masks.append(torch.cat([torch.ones(s, dtype=torch.bool), torch.zeros(sizediff, dtype=torch.bool)]))
+        else:
+            masks.append(torch.ones(slices_feats[idx].shape[0], dtype=torch.bool))
+    incpufeats = torch.stack(slices_feats).cpu()
+    studies=study_id
+    slices=incpufeats
+    slicemasks=torch.stack(masks)
+    plane_ids=torch.tensor(new_plane_ids, dtype=torch.long)
+    fats=torch.tensor(new_fats, dtype=torch.long)
+    fluids=torch.tensor(new_fluids, dtype=torch.long)
+    stype=torch.tensor(new_stype, dtype=torch.long)
+    plane_crop_mixed=torch.tensor(new_plane_crop_mixed, dtype=torch.long)
     maxslicesize = max([slice.shape[1] for slice in slices])
     maxseriesize = max([slice.shape[0] for slice in slices])
-    paddedslicemasks, paddedplane_ids, paddedfluids, paddedfats, paddedstype, paddedplane_crop_mixed, seriemasks = [], [], [], [], [], [], []
+    paddedslices, paddedslicemasks, paddedplane_ids, paddedfluids, paddedfats, paddedstype, paddedplane_crop_mixed, seriemasks = [], [], [], [], [], [], [], []
     for i in range(len(slices)):
         newslice, newslicemask = slices[i], slicemasks[i]
         newplane_id, newfluid, newfat = plane_ids[i], fluids[i], fats[i]
@@ -874,88 +932,73 @@ def extract_image_features(batch, visionmodel, roiextractor, caching=True):
         seriemasks.append(newseriemask)
         paddedstype.append(newstype)
         paddedplane_crop_mixed.append(newplane_crop_mixed)
-    kfold_padded_slices=[]
-    paddedslices = []
-    for i in range(len(slices)):
-        newslice = slices[i]
-        if newslice.shape[1] < maxslicesize:
-            slicediffer = maxslicesize - newslice.shape[1]
-            newslice = torch.cat([newslice, torch.zeros((newslice.shape[0], slicediffer, newslice.shape[-3], newslice.shape[-2], newslice.shape[-1]))], dim=1)
-        if newslice.shape[0] < maxseriesize:
-            s = newslice.shape[0]
-            seriediffer = maxseriesize - s
-            newslice = torch.cat([newslice, torch.zeros((seriediffer, newslice.shape[1], newslice.shape[-3], newslice.shape[-2], newslice.shape[-1]))], dim=0)
         paddedslices.append(newslice)
-    newpaddedfluids=[]
-    newpaddedfats=[]
-    newseriemasks=[]
-    new_plane_crop_mixed=[]
-    new_plane_ids=[]
-    new_stype=[]
-    newslicemasks=[]
-    newslices=[]
-    for idx,study in enumerate(studies):
-        pfluid=torch.zeros(6)
-        pfat=torch.zeros(6)
-        pids=torch.zeros(6)
-        nsm=torch.zeros(6,dtype=torch.bool)
-        npcm=torch.zeros(6,2)
-        ns=torch.tensor([0,1,2,3,4,5])
-        nslicem=torch.zeros((6,paddedslices[idx].shape[1]),dtype=torch.bool)
-        newshape=list(paddedslices[idx].shape)
-        newshape[0]=6
-        nslice=torch.zeros(newshape,dtype=torch.float)
-        for idx2,j in enumerate(paddedstype[idx]):
-            pfat[j]=paddedfats[idx][idx2]
-            pfluid[j]=paddedfluids[idx][idx2]
-            nsm[j]=seriemasks[idx][idx2]
-            npcm[j]=paddedplane_crop_mixed[idx][idx2]
-            ns[j]=j
-            nslicem[j]=paddedslicemasks[idx][idx2]
-            nslice[j]=paddedslices[idx][idx2]
-            pids[j]=paddedplane_ids[idx][idx2]
-        newpaddedfluids.append(pfluid)
-        newpaddedfats.append(pfat)
-        newseriemasks.append(nsm)
-        new_plane_crop_mixed.append(npcm)
-        new_stype.append(ns)
-        newslicemasks.append(nslicem)
-        newslices.append(nslice)
-        new_plane_ids.append(pids)
+    kfold_padded_slices=[]
+    # paddedslices = []
+    # for i in range(len(slices)):
+    #     newslice = slices[i]
+    #     if newslice.shape[1] < maxslicesize:
+    #         slicediffer = maxslicesize - newslice.shape[1]
+    #         newslice = torch.cat([newslice, torch.zeros((newslice.shape[0], slicediffer, newslice.shape[-3], newslice.shape[-2], newslice.shape[-1]))], dim=1)
+    #     if newslice.shape[0] < maxseriesize:
+    #         s = newslice.shape[0]
+    #         seriediffer = maxseriesize - s
+    #         newslice = torch.cat([newslice, torch.zeros((seriediffer, newslice.shape[1], newslice.shape[-3], newslice.shape[-2], newslice.shape[-1]))], dim=0)
+    #     paddedslices.append(newslice)
+    paddedslices=torch.stack(paddedslices)
+    # pfluid=torch.zeros(6)
+    # pfat=torch.zeros(6)
+    # pids=torch.zeros(6)
+    # nsm=torch.zeros(6,dtype=torch.bool)
+    # npcm=torch.zeros(6,2)
+    # ns=torch.tensor([0,1,2,3,4,5])
+    # nslicem=torch.zeros((6,paddedslices.shape[1]),dtype=torch.bool)
+    # newshape=list(paddedslices.shape)
+    # newshape[0]=6
+    # nslice=torch.zeros(newshape,dtype=torch.float)
+    # for idx2,j in enumerate(paddedstype):
+    #     pfat[j]=paddedfats[idx2]
+    #     pfluid[j]=paddedfluids[idx2]
+    #     nsm[j]=seriemasks[idx2]
+    #     npcm[j]=paddedplane_crop_mixed[idx2]
+    #     ns[j]=j
+    #     nslicem[j]=paddedslicemasks[idx2]
+    #     nslice[j]=paddedslices[idx2]
+    #     pids[j]=paddedplane_ids[idx2]
     return {
-        "study_id": studies,
-        "labels": batched_labels,
-        "slicemasks": torch.stack(newslicemasks, dim=0),
-        "plane_ids": torch.stack(new_plane_ids, dim=0).long(),
-        "fluid_sensitive": torch.stack(new_fluids, dim=0).long(),
-        "fat_suppression": torch.stack(new_fats, dim=0).long(),
-        "serie_type": torch.stack(new_stype, dim=0).long(),
-        "seriemasks": torch.stack(newseriemasks, dim=0),
-        "slices": torch.stack(newslices, dim=0),
-        "plane_crop_mixed": torch.stack(new_plane_crop_mixed, dim=0).long(),
+        "study_id": study_id,
+        "labels": labels,
+        "slicemasks": torch.stack(paddedslicemasks),
+        "plane_ids": torch.stack(paddedplane_ids).long(),
+        "fluid_sensitive": torch.stack(paddedfluids).long(),
+        "fat_suppression": torch.stack(paddedfats).long(),
+        "serie_type": torch.stack(paddedstype).long(),
+        "seriemasks": torch.stack(seriemasks),
+        "slices": paddedslices,
+        "plane_crop_mixed": torch.stack(paddedplane_crop_mixed).long(),
     }
-
 def smooth_labels(targets, smoothing=0.05):
-    return targets * (1.0 - smoothing) + 0.5 * smoothing
+    return targets#targets * (1.0 - smoothing) + 0.5 * smoothing
 # ── Train & Eval Epochs ───────────────────────────────────────────────────────
 def train_epoch(model, loader, visionmodel, roiextractor, optimizer, criterion, scaler, cfg, iscached=True,dinofold=0):
     model.train()
-    visionmodel.train()
     losses = []
     optimizer.zero_grad()
 
     pbar = tqdm(loader, desc='Train', leave=False)
+    positives=0
+    negatives=0
     for batch_idx, batch in enumerate(pbar):
-        if not iscached:
-            if cfg.USE_AMP:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    batched_features = extract_image_features(batch, visionmodel, roiextractor, caching=False)
-                    batch = batched_features
-            else:
-                batched_features = extract_image_features(batch, visionmodel, roiextractor, caching=False)
-                batch = batched_features
+        # if not iscached:
+        #     if cfg.USE_AMP:
+        #         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        #             batched_features = extract_image_features(batch, visionmodel, roiextractor, caching=False)
+        #             batch = batched_features
+        #     else:
+        #         batched_features = extract_image_features(batch, visionmodel, roiextractor, caching=False)
+        #         batch = batched_features
 
-        labels = batch["labels"].to(cfg.DEVICE)[:,cfg.TRAINING_LABEL].unsqueeze(1)
+        labels = batch["labels"].to(cfg.DEVICE)
         # labels[labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER] = 1.0
         # labels[labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER] = 0.0
         # labelsmasks = (labels >= cfg.LABEL_CLAMP_THRESHOLD_UPPER) | (labels <= cfg.LABEL_CLAMP_THRESHOLD_LOWER)
@@ -974,49 +1017,78 @@ def train_epoch(model, loader, visionmodel, roiextractor, optimizer, criterion, 
         else:
             if cfg.USE_AMP:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype, visionmodel=visionmodel)
-                    smoothed_targets = smooth_labels(labels.float(), smoothing=0.05+(random.random()*0.05))
-                    loss = criterion(logits.float(), smoothed_targets.float())
-                    loss = loss / cfg.GRAD_ACCUM_STEPS
+                    blosses=[]
+                    for seriecount in range(slices.shape[1]):
+                        nslices = slices[:, seriecount]
+                        with torch.no_grad():
+                            b,s,c,h,w=nslices.shape
+                            nslices=nslices.view(b*s,c,h,w)
+                            nslices=train_transforms(nslices)
+                            nslices=nslices.view(b,s,c,nslices.shape[-2],nslices.shape[-1])
+                        nslicemasks = slicemasks[:, seriecount]
+                        nserietype = serietype[:, seriecount]
+                        logits = model.forward(nslices, nslicemasks, nserietype)
+                        smoothed_targets = smooth_labels(labels.float(), smoothing=0.05+(random.random()*0.05))
+                        loss = criterion(logits.float(), smoothed_targets.float())/(slices.shape[1]*cfg.GRAD_ACCUM_STEPS)
+                        blosses.append(loss)
+                        loss.backward()
+                    loss = torch.sum(torch.stack(blosses))
             else:
-                logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype, visionmodel=visionmodel)
-                smoothed_targets = smooth_labels(labels.float(), smoothing=0.05+(random.random()*0.05))
-                loss = criterion(logits, smoothed_targets)
-                loss = loss / cfg.GRAD_ACCUM_STEPS
-            loss.backward()
+                blosses=[]
+                for seriecount in range(slices.shape[1]):
+                    nslices = slices[:, seriecount]
+                    with torch.no_grad():
+                        b,s,c,h,w=nslices.shape
+                        nslices=nslices.view(b*s,c,h,w)
+                        nslices=train_transforms(nslices)
+                        nslices=nslices.view(b,s,c,nslices.shape[-2],nslices.shape[-1])
+                    nslicemasks = slicemasks[:, seriecount]
+                    nserietype = serietype[:, seriecount]
+                    logits = model.forward(nslices, nslicemasks, nserietype)
+                    smoothed_targets = smooth_labels(labels.float(), smoothing=0.05+(random.random()*0.05))
+                    loss = criterion(logits.float(), smoothed_targets.float())/(slices.shape[1]*cfg.GRAD_ACCUM_STEPS)
+                    blosses.append(loss)
+                    loss.backward()
+                loss = torch.sum(torch.stack(blosses))
+            # loss.backward()
             if (batch_idx + 1) % cfg.GRAD_ACCUM_STEPS == 0 or (batch_idx + 1) == len(loader):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(visionmodel.parameters(), max_norm=1.0)
                 optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad()
 
             if torch.isnan(logits).any():
                 print("❌ Model produced NaN outputs!")
             losses.append(loss.item() * cfg.GRAD_ACCUM_STEPS)
             pbar.set_postfix({'loss': f'{np.mean(losses):.4f}'})
+            posmask=(labels.float()>0.5)
+            positivelabels=posmask.float().sum().item()
+            negativelabels = (~posmask).float().sum().item()
+            positives+=positivelabels
+            negatives+=negativelabels
+            pass
+
         # torch.cuda.empty_cache()
 
-    return np.mean(losses)
+    return np.mean(losses),(negatives/positives)
 
 
 @torch.no_grad()
 def eval_epoch(model, loader, visionmodel, roiextractor, criterion, cfg, iscached=True,dinofold=0):
     model.eval()
-    visionmodel.eval()
     losses = []
     all_preds, all_labels = [], []
 
     for batch in tqdm(loader, desc="Val", leave=False):
-        if not iscached:
-            if cfg.USE_AMP:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    batched_features = extract_image_features(batch, visionmodel, roiextractor, caching=False)
-                    batch = batched_features
-            else:
-                batched_features = extract_image_features(batch, visionmodel, roiextractor, caching=False)
-                batch = batched_features
+        # if not iscached:
+        #     if cfg.USE_AMP:
+        #         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        #             batched_features = extract_image_features(batch, visionmodel, roiextractor, caching=False)
+        #             batch = batched_features
+        #     else:
+        #         batched_features = extract_image_features(batch, visionmodel, roiextractor, caching=False)
+        #         batch = batched_features
 
-        labels = batch["labels"].to(cfg.DEVICE)[:,cfg.TRAINING_LABEL].unsqueeze(1)
+        labels = batch["labels"].to(cfg.DEVICE)
         slices = batch["slices"].to(cfg.DEVICE)
         slicemasks = batch["slicemasks"].to(cfg.DEVICE)
         fats = batch["fat_suppression"].to(cfg.DEVICE)
@@ -1027,18 +1099,48 @@ def eval_epoch(model, loader, visionmodel, roiextractor, criterion, cfg, iscache
         serietype = batch["serie_type"].to(cfg.DEVICE)
 
         if cfg.USE_AMP:
-            with torch.amp.autocast("cuda", dtype=torch.float16):
-                logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype, visionmodel=visionmodel)
-                loss = criterion(logits.float(), labels)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                blosses = []
+                nlogits=[]
+                for seriecount in range(slices.shape[1]):
+                    nslices = slices[:, seriecount]
+                    with torch.no_grad():
+                        b,s,c,h,w=nslices.shape
+                        nslices=nslices.view(b*s,c,h,w)
+                        nslices=inference_transforms(nslices)
+                        nslices=nslices.view(b,s,c,nslices.shape[-2],nslices.shape[-1])
+                    nslicemasks = slicemasks[:, seriecount]
+                    nserietype = serietype[:, seriecount]
+                    logits = model.forward(nslices, nslicemasks, nserietype)
+                    nlogits.append(logits)
+                    loss = criterion(logits.float(), labels)/(slices.shape[1]*cfg.GRAD_ACCUM_STEPS)
+                    blosses.append(loss)
+                loss = torch.sum(torch.stack(blosses))
+                logits=torch.cat(nlogits,dim=0).mean(dim=0).unsqueeze(dim=0)
         else:
-            logits = model.forward(slices, slicemasks, seriemasks, plane_ids, fluids, fats, plane_crop_mixed, serietype, visionmodel=visionmodel)
-            loss = criterion(logits.float(), labels)
+            blosses = []
+            nlogits=[]
+            for seriecount in range(slices.shape[1]):
+                nslices = slices[:, seriecount]
+                with torch.no_grad():
+                    b,s,c,h,w=nslices.shape
+                    nslices=nslices.view(b*s,c,h,w)
+                    nslices=inference_transforms(nslices)
+                    nslices=nslices.view(b,s,c,nslices.shape[-2],nslices.shape[-1])
+                nslicemasks = slicemasks[:, seriecount]
+                nserietype = serietype[:, seriecount]
+                logits = model.forward(nslices, nslicemasks, nserietype)
+                nlogits.append(logits)
+                loss = criterion(logits.float(), labels)/(slices.shape[1]*cfg.GRAD_ACCUM_STEPS)
+                blosses.append(loss)
+            loss = torch.sum(torch.stack(blosses))
+            logits=torch.cat(nlogits,dim=0).mean(dim=0).unsqueeze(dim=0)
         losses.append(loss.item())
 
         if torch.isnan(logits).any():
             print("❌ Model produced NaN outputs!")
 
-        preds = torch.sigmoid(logits).cpu().numpy()
+        preds = torch.sigmoid(logits).float().cpu().numpy()
         all_preds.append(preds)
         all_labels.append(labels.cpu().numpy())
 
@@ -1046,10 +1148,10 @@ def eval_epoch(model, loader, visionmodel, roiextractor, criterion, cfg, iscache
     all_labels = np.concatenate(all_labels)
     binary_labels = (all_labels >= 0.5).astype(int)
     val_loss = np.mean(losses)
-    try:
-        val_auc = roc_auc_score(binary_labels, all_preds)
-    except ValueError:
-        val_auc = 0.5
+    # try:
+    val_auc = roc_auc_score(binary_labels, all_preds)
+    # except ValueError:
+    #     val_auc = 0.5
 
     return val_loss, val_auc, all_preds, all_labels
 
@@ -1440,7 +1542,45 @@ def LoadRadImageNet(densenet=False):
         xxx=model.load_state_dict(newsd,strict=False)
         return model
 
+
+class BinaryMultiTaskLoss(nn.Module):
+    def __init__(self, num_tasks=12):
+        super().__init__()
+        # 12 trainable parameters to balance task priorities dynamically
+        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, predictions, targets):
+        # predictions and targets shape: (batch_size, 12)
+        total_loss = 0.0
+        log_vars = self.log_vars.clamp(-3.0, 3.0)
+
+        for i in range(len(self.log_vars)):
+            task_loss = self.bce(predictions[:, i].float(), targets[:, i].float())
+
+            # softplus(log_var) > 0 keeps the total loss non-negative (the classic `+ log_var` term drifts below 0)
+            weighted_loss = torch.exp(-log_vars[i]) * task_loss + F.softplus(log_vars[i])
+
+            total_loss += weighted_loss
+
+        return total_loss
+
+
+class PlainMultiTaskLoss(nn.Module):
+    """Unweighted sum of per-label BCE-with-logits; stable and comparable across epochs, used for validation monitoring."""
+
+    def __init__(self, num_tasks=12):
+        super().__init__()
+        self.num_tasks = num_tasks
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, predictions, targets):
+        return sum(self.bce(predictions[:, i].float(), targets[:, i].float()) for i in range(self.num_tasks))
+
+
 def main():
+    global inference_transforms
+    global train_transforms
     print(torch.__version__)
     print('✓ All imports successful')
     print('Loading metadata...')
@@ -1540,12 +1680,33 @@ def main():
             #                                 dynamic_img_size=True, checkpoint_path="radiodinos16.safetensors")
             # # visionmodel.load_state_dict(torch.load(f"radiodinov2_ssl_finetuned_backbone.pth")["model_state_dict"])
             # visionmodel=LoadRadImageNet(densenet=False)
-            visionmodel=timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224,224))#torchvision.models.resnext50_32x4d()#timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))
+            modelweights=torchvision.models.Swin_V2_T_Weights
+            inference_transforms=torchvision.transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.Lambda(foreground_zscore)
+            ])
+            # crop_size = swinweight.transforms.crop_size[0]
+            # resize_size = swinweight.transforms.resize_size[0]
+            # train_transforms=torchvision.transforms.Compose([
+            #     torchvision.transforms.RandomRotation(10),
+            #     torchvision.transforms.RandomCrop(size=[256, 256] , padding=8),
+            #     torchvision.transforms.Lambda(lambda x: (x - x.mean()) / (x.std() + 1e-5))
+            # ])
+            train_transforms = transforms.Compose([
+                # Spatial: Mild rotation and standard padding crop (preserves full organ view)
+                transforms.RandomRotation(degrees=10),
+                transforms.RandomCrop(size=[224, 224], padding=12),
+
+                # Intensity: ColorJitter handles brightness/contrast while input is in [0, 1]
+                transforms.ColorJitter(brightness=(0.8, 1.2), contrast=(0.7, 1.3)),
+
+                # Standardization: Final Z-score on non-zero tissue regions
+                transforms.Lambda(foreground_zscore)
+            ])
+            visionmodel, visionmodel2 = build_backbones(pretrained=True)
+            #visionmodel=timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(384,384))#torchvision.models.resnext50_32x4d()#timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))
             # visionmodel.classifier=nn.Identity()
-            testout=visionmodel(torch.rand(1,3,224,224))
-            visionmodel.train()
-            visionmodel.requires_grad_(False)
-            visionmodel.to(cfg.DEVICE)
+            # testout=visionmodel(torch.rand(1,3,224,224))
 
             train_sub = Subset(train_cached_ds, train_idx)
             val_sub = Subset(train_cached_ds, val_idx)
@@ -1574,7 +1735,7 @@ def main():
             print(f"Fold {dinofold}-{fold + 1} - Train samples: {len(train_sub)} | Val samples: {len(val_sub)}")
 
             # Fresh Main Model Instance per Fold
-            model = KneeAbnormalityModelRefactored(cfg,inputdim=1536).to(cfg.DEVICE)
+            model = KneeAbnormalityModelRefactored(cfg,inputdim=BACKBONE_FEAT_DIM,backbone=visionmodel).to(cfg.DEVICE)
             model.train()
             if cfg.LOAD_PATH.exists():
                 model.load_state_dict(torch.load(cfg.LOAD_PATH, weights_only=True)["model_state_dict"], strict=False)
@@ -1582,17 +1743,18 @@ def main():
             trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             total_params = sum(p.numel() for p in model.parameters())
             print(f"Fold {dinofold}-{fold + 1} Model Params: Trainable {trainable_params:,} / Total {total_params:,}")
+            criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')#BinaryMultiTaskLoss(12)#AsymmetricLossOptimized(gamma_neg=4.0, gamma_pos=0.0, clip=0.05)
 
             optimizer = torch.optim.AdamW([
-                {'params': visionmodel.parameters(), 'lr': cfg.VLR},  # 1e-6 for backbone
-                {'params': model.parameters(), 'lr': cfg.LR}  # 1e-4 for head
+                # {'params': visionmodel.parameters(), 'lr': cfg.VLR},  # 1e-6 for backbone
+                {'params': model.parameters(), 'lr': cfg.LR},  # 1e-4 for head
+                {'params': criterion.parameters(), 'lr': cfg.LR},
             ], weight_decay=cfg.WEIGHT_DECAY)
             scheduler_cosine = CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=cfg.MIN_LR)
             scheduler_warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=cfg.WARMUP_EPOCHS)
             scheduler = SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[cfg.WARMUP_EPOCHS])
             scaler = torch.amp.GradScaler(cfg.DEVICE)
-            criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')#AsymmetricLossOptimized(gamma_neg=4.0, gamma_pos=0.0, clip=0.05)
-            valcriterion= torch.nn.MSELoss(reduction="sum")
+            valcriterion = PlainMultiTaskLoss(12)
 
             save_path_fold = str(cfg.PYTHON_DIR / f"best_model_dino_fold_{dinofold}_{fold}_label{cfg.TRAINING_LABEL}.pth")
             save_path_fold_v = str(cfg.PYTHON_DIR / f"best_vmodel_dino_fold_{dinofold}_{fold}_label{cfg.TRAINING_LABEL}.pth")
@@ -1604,46 +1766,46 @@ def main():
             best_val_targets = None
             without_save_epochs = 0
             patience = 10
-            for param in visionmodel.parameters():
+            for param in model.backbone.parameters():
                 param.requires_grad = False
 
             for epoch in range(cfg.EPOCHS):
                 print(f"\n--- Fold {dinofold}-{fold + 1} | Epoch {epoch + 1}/{cfg.EPOCHS} ---")
                 without_save_epochs += 1
-                if epoch%2==0:#cfg.WARMUP_EPOCHS
-                    NUM_BLOCKS_TO_UNFREEZE = epoch//2
-                    unfreeze_order = [
-                        ("stem", visionmodel.stem),
-                        *[(f"stage_{i}", stage) for i, stage in enumerate(visionmodel.stages)],
-                        ("head", visionmodel.head)
-                    ]
+                if epoch==cfg.WARMUP_EPOCHS:#cfg.WARMUP_EPOCHS
+                    # NUM_BLOCKS_TO_UNFREEZE = epoch//2
+                    # unfreeze_order = [
+                    #     ("stem", visionmodel.stem),
+                    #     *[(f"stage_{i}", stage) for i, stage in enumerate(visionmodel.stages)],
+                    #     ("head", visionmodel.head)
+                    # ]
                     # Access the blocks sequence from the backbone
                     # If using the wrapper from the previous prompt, it's model.blocks
                     # If using a raw timm model directly, it's model.blocks
-                    transformer_blocks = visionmodel.blocks
-                    total_blocks = len(transformer_blocks)
+                    # transformer_blocks = visionmodel.blocks
+                    # total_blocks = len(unfreeze_order)
 
-                    print(f"Unfreezing {NUM_BLOCKS_TO_UNFREEZE} Transformer Block")
-                    # 3. Unfreeze the last N blocks
-                    for i in range(total_blocks - NUM_BLOCKS_TO_UNFREEZE, total_blocks):
-                        for param in transformer_blocks[i].parameters():
-                            param.requires_grad = True
-                    # print(" Unfreezing backbone with differential learning rates...")
-                    # for param in visionmodel.parameters():
-                    #     param.requires_grad = True
-                    # # for param in model.parameters():
-                    # #     param.requires_grad = False
+                    # print(f"Unfreezing {NUM_BLOCKS_TO_UNFREEZE} Transformer Block")
+                    # # 3. Unfreeze the last N blocks
+                    # for i in range(total_blocks - NUM_BLOCKS_TO_UNFREEZE, total_blocks):
+                    #     for param in unfreeze_order[i][1].parameters():
+                    #         param.requires_grad = True
+                    print(" Unfreezing backbone with differential learning rates...")
+                    for param in model.backbone.parameters():
+                        param.requires_grad = True
+                    # for param in model.parameters():
+                    #     param.requires_grad = False
 
                     # optimizer = torch.optim.AdamW([
                     #     {'params': visionmodel.parameters(), 'lr': cfg.VLR},  # 1e-6 for backbone
                     #     {'params': model.parameters(), 'lr': cfg.LR}            # 1e-4 for head
                     # ], weight_decay=cfg.WEIGHT_DECAY)
-
+                    #
                     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS - 1, eta_min=cfg.MIN_LR)
-                train_loss = train_epoch(model, ld_train, visionmodel, None, optimizer, criterion, scaler, cfg, iscached=False,dinofold=dinofold)
-                val_loss, val_auc, val_preds, val_targets = eval_epoch(model, ld_val, visionmodel, None, criterion, cfg, iscached=False,dinofold=dinofold)
-                gval_loss, gval_auc, gval_preds, gval_targets = eval_epoch(model, ld_val_gold, visionmodel, None, criterion, cfg, iscached=False,dinofold=dinofold)
-
+                train_loss,posweight = train_epoch(model, ld_train, None, None, optimizer, criterion, scaler, cfg, iscached=False,dinofold=dinofold)
+                val_loss, val_auc, val_preds, val_targets = eval_epoch(model, ld_val, None, None, valcriterion, cfg, iscached=False,dinofold=dinofold)
+                gval_loss, gval_auc, gval_preds, gval_targets = eval_epoch(model, ld_val_gold, None, None, valcriterion, cfg, iscached=False,dinofold=dinofold)
+                # criterion=torch.nn.BCEWithLogitsLoss(reduction='none',pos_weight=torch.tensor([posweight]).to(cfg.DEVICE))
                 current_lr = optimizer.param_groups[0]["lr"]
                 scheduler.step()
 
@@ -1672,14 +1834,14 @@ def main():
                         'val_auc': float(gval_auc),
                         'val_loss': float(val_loss),
                     }, save_path_fold)
-                    torch.save({
-                        'fold': fold,
-                        'dinofold': dinofold,
-                        'epoch': epoch,
-                        'model_state_dict': visionmodel.state_dict(),
-                        'val_auc': float(gval_auc),
-                        'val_loss': float(val_loss),
-                    }, save_path_fold_v)
+                    # torch.save({
+                    #     'fold': fold,
+                    #     'dinofold': dinofold,
+                    #     'epoch': epoch,
+                    #     'model_state_dict': visionmodel.state_dict(),
+                    #     'val_auc': float(gval_auc),
+                    #     'val_loss': float(val_loss),
+                    # }, save_path_fold_v)
                     print(f"  -> Saved new best checkpoint for Fold {dinofold}-{fold + 1} (GOLD AUC: {gval_auc:.4f}) -> {save_path_fold}")
                 if without_save_epochs >= patience:
                     print(f"Early stopping triggered for Fold {dinofold}-{fold + 1} at epoch {epoch + 1}")
@@ -1771,6 +1933,31 @@ def evaluate_ensemble(
     Returns:
         tuple: (overall_ensemble_auc, per_label_aucs_dict, ensemble_predictions)
     """
+
+    global inference_transforms
+    global train_transforms
+    inference_transforms = torchvision.transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.Lambda(foreground_zscore)
+    ])
+    # crop_size = swinweight.transforms.crop_size[0]
+    # resize_size = swinweight.transforms.resize_size[0]
+    # train_transforms=torchvision.transforms.Compose([
+    #     torchvision.transforms.RandomRotation(10),
+    #     torchvision.transforms.RandomCrop(size=[256, 256] , padding=8),
+    #     torchvision.transforms.Lambda(lambda x: (x - x.mean()) / (x.std() + 1e-5))
+    # ])
+    train_transforms = transforms.Compose([
+        # Spatial: Mild rotation and standard padding crop (preserves full organ view)
+        transforms.RandomRotation(degrees=10),
+        transforms.RandomCrop(size=[224, 224], padding=12),
+
+        # Intensity: ColorJitter handles brightness/contrast while input is in [0, 1]
+        transforms.ColorJitter(brightness=(0.8, 1.2), contrast=(0.7, 1.3)),
+
+        # Standardization: Final Z-score on non-zero tissue regions
+        transforms.Lambda(foreground_zscore)
+    ])
     if fold_paths is None:
         fold_paths=[]
         for dinofold in range(cfg.NUM_FOLDS):
@@ -1789,19 +1976,15 @@ def evaluate_ensemble(
                 continue
 
             print(f"Loading checkpoint [{fold_idx+dinofold + 1}/{len(fold_paths)}]: {path}")
-            model = model_class(cfg,inputdim=1536).to(cfg.DEVICE)
+            visionmodel, visionmodel2 = build_backbones(pretrained=False)
+            # visionmodel=timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(384,384))#timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))#torchvision.models.resnext50_32x4d(pretrained=False)
+            model = model_class(cfg,inputdim=BACKBONE_FEAT_DIM,backbone=visionmodel).to(cfg.DEVICE)
             checkpoint = torch.load(path, map_location=cfg.DEVICE)
             model.load_state_dict(checkpoint['model_state_dict'])
-            visionmodel=timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224,224))#timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, img_size=(224, 224))#torchvision.models.resnext50_32x4d(pretrained=False)
             # visionmodel.classifier=nn.Identity()
-            vcheckpoint = torch.load(vpath, map_location=cfg.DEVICE)
-            visionmodel.load_state_dict(vcheckpoint['model_state_dict'])
-            testout=visionmodel(torch.rand(1,3,224,224))
-            visionmodel.eval()
-            visionmodel.to(cfg.DEVICE)
             # Predict using current fold model
             val_loss, val_auc, fold_preds, fold_targets = eval_epoch(
-                model, val_loader, visionmodel=visionmodel, roiextractor=None, criterion=criterion, cfg=cfg, iscached=False, dinofold=dinofold
+                model, val_loader, visionmodel=None, roiextractor=None, criterion=criterion, cfg=cfg, iscached=False, dinofold=dinofold
             )
 
             all_fold_preds.append(fold_preds)
